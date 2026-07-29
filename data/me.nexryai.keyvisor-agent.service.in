@@ -1,0 +1,12 @@
+[Unit]
+Description=Keyvisor TPM-backed SSH agent
+Documentation=man:ssh-agent(1)
+
+[Service]
+Type=simple
+Environment=KEYVISOR_PIN_HELPER_PATH=@bindir@/keyvisor
+ExecStart=@bindir@/keyvisor-agent serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

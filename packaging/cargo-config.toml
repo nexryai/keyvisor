@@ -1,0 +1,10 @@
+# COPR and mock build without network access, so every crate must come from
+# the vendor archive attached to the source RPM.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+[net]
+offline = true

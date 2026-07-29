@@ -1,0 +1,7 @@
+/build/
+/dist/
+/rpmbuild/
+/target/
+/vendor/
+*.flatpak
+*.flatpak-builder

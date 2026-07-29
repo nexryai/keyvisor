@@ -1,0 +1,11 @@
+[Unit]
+Description=Keyvisor TPM-backed SSH agent socket
+
+[Socket]
+ListenStream=%t/keyvisor/agent.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

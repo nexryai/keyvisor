@@ -1,0 +1,7 @@
+option(
+  'cargo-profile',
+  type: 'combo',
+  choices: ['auto', 'debug', 'release'],
+  value: 'auto',
+  description: 'Cargo profile used for the Keyvisor executables',
+)

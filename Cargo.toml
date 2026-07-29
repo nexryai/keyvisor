@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/keyvisor-agent",
+    "crates/keyvisor-core",
+    "crates/keyvisor-tpm",
+    "crates/keyvisor-ui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.dependencies]
+keyvisor-core = { path = "crates/keyvisor-core" }
+keyvisor-tpm = { path = "crates/keyvisor-tpm" }
