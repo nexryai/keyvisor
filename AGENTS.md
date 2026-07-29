@@ -69,6 +69,11 @@ metadata, public material, user decisions, and results.
 5. Validate desktop files and AppStream metadata after editing `data/`.
 6. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
    must never clear, take ownership of, or evict unrelated persistent objects.
+7. Create Git commits at frequent, meaningful checkpoints with
+   `git commit -m "<message>"`. Each commit should contain one coherent,
+   reviewed change and use a concise message that describes the outcome.
+   Commit after the relevant focused checks pass; do not mix unrelated,
+   generated, or knowingly broken changes into the same commit.
 
 Avoid `unsafe`; workspace lints forbid it. Keep dependencies narrow and review
 cryptographic and serialization dependencies explicitly.
