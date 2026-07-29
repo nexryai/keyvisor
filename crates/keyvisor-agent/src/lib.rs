@@ -535,6 +535,55 @@ mod tests {
     }
 
     #[test]
+    fn listing_fails_closed_for_a_corrupted_record() {
+        let directory = temporary_directory();
+        let store = KeyStore::new(&directory);
+        let key = fixture("corrupted");
+        store.save(&key).expect("save record before corruption");
+        let record_path = fs::read_dir(&directory)
+            .expect("read store directory")
+            .next()
+            .expect("store has one record")
+            .expect("read store entry")
+            .path();
+        let mut bytes = fs::read(&record_path).expect("read encoded record");
+        bytes[0] ^= 0xff;
+        fs::write(&record_path, bytes).expect("corrupt encoded record");
+
+        // Listing must surface corruption instead of hiding the affected key.
+        // A partial identity set could otherwise make tampering look like an
+        // ordinary user deletion.
+        assert!(matches!(store.list(), Err(StoreError::InvalidRecord)));
+
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_rejects_symlinked_key_records() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let store = KeyStore::new(&directory);
+        let key = fixture("symlink-target");
+        store.save(&key).expect("save symlink target");
+        let real_record = fs::read_dir(&directory)
+            .expect("read store directory")
+            .next()
+            .expect("store has one record")
+            .expect("read store entry")
+            .path();
+        symlink(&real_record, directory.join("alias.key")).expect("create record symlink");
+
+        // Following a `.key` symlink would let another filesystem location
+        // supply agent metadata after directory validation. Only regular files
+        // directly owned by the store are accepted.
+        assert!(matches!(store.list(), Err(StoreError::InvalidRecord)));
+
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[test]
     fn deletes_only_the_selected_wrapped_record() {
         let directory = temporary_directory();
         let store = KeyStore::new(&directory);
