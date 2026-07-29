@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Source access is sufficient: tests create only local processes, sockets, and
+# temporary files inside the runner.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Rust, swtpm, and OpenSSH
+    runs-on: ubuntu-latest
+    container:
+      # Fedora is the supported packaging target, so CI resolves the same GTK,
+      # Libadwaita, TPM2-TSS, swtpm, and OpenSSH integration surface as users.
+      image: fedora:44
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      # A minimal Fedora container does not contain the native development
+      # headers or external clients exercised by the integration tests.
+      - name: Install Fedora test dependencies
+        run: >-
+          dnf --assumeyes --setopt=install_weak_deps=False install
+          cargo
+          clippy
+          gcc
+          git
+          gtk4-devel
+          libadwaita-devel
+          openssh-clients
+          pkgconf-pkg-config
+          rust
+          rustfmt
+          swtpm
+          tpm2-tss-devel
+
+      # Pin the action by its complete commit so changes to a mutable tag cannot
+      # alter code that runs with access to the checked-out source.
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Unit and binary tests do not need a TPM. Running them separately keeps
+      # failures in parsing, storage, and UI state distinct from simulator
+      # startup or external-client failures.
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --lib --bins
+
+      # The TPM suite starts one isolated swtpm per test. It verifies real ESAPI
+      # generation/signing, authorization policy, and wrapped-object reloads;
+      # it never opens the runner's physical TPM device.
+      - name: Run swtpm integration tests
+        run: cargo test -p keyvisor-tpm --test swtpm -- --nocapture
+
+      # This suite starts both swtpm and the real agent executable. Stock
+      # ssh-add parses identities, while ssh-keygen requests a signature through
+      # SSH_AUTH_SOCK and verifies the resulting SSHSIG cryptographically.
+      - name: Run OpenSSH agent integration tests
+        run: cargo test -p keyvisor-agent --test agent_socket -- --nocapture

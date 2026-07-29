@@ -202,6 +202,9 @@ and is paired with a monochrome symbolic icon.
 - [x] systemd user service and native socket-activation unit;
 - [x] Fedora RPM spec, locked offline crate vendor archive, local SRPM helper,
   and COPR `make_srpm` SCM integration;
+- [x] GitHub Actions checks formatting and lints, runs unit tests, exercises the
+  TPM backend through isolated `swtpm` instances, and verifies agent
+  interoperability with stock OpenSSH clients;
 - environment setup helper;
 - Flatpak feasibility review (TPM device and SSH socket access may favor native
   packaging);

@@ -114,7 +114,15 @@ cargo test --workspace --all-features
 ```
 
 The TPM integration test starts its own temporary `swtpm` and never touches a
-physical TPM.
+physical TPM. The agent integration suite also invokes the installed
+`ssh-add` and `ssh-keygen` clients. It confirms that OpenSSH can enumerate a
+Keyvisor identity, request a TPM-backed signature over `SSH_AUTH_SOCK`, and
+cryptographically verify the resulting SSHSIG.
+
+GitHub Actions repeats formatting, Clippy, unit, `swtpm`, and OpenSSH checks in
+a Fedora container. The workflow installs the same test dependencies listed
+above and keeps the simulator-backed suites in separate named steps so TPM and
+wire-protocol failures are visible independently.
 
 See `PLASN.md` for the implementation plan and security model.
 
