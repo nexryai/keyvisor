@@ -216,7 +216,8 @@ mod tests {
     use keyvisor_core::{KeyAlgorithm, KeyId, KeySummary, KeyUsePolicy};
 
     use super::{
-        AgentRequest, ProtocolError, ecdsa_signature_response, identities_response, parse_request,
+        AgentRequest, MAX_PACKET_LENGTH, ProtocolError, ecdsa_signature_response, failure_response,
+        identities_response, parse_request,
     };
 
     fn ssh_string(output: &mut Vec<u8>, value: &[u8]) {
@@ -226,6 +227,19 @@ mod tests {
                 .to_be_bytes(),
         );
         output.extend_from_slice(value);
+    }
+
+    fn take_test_string<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+        let length = u32::from_be_bytes(
+            input[..4]
+                .try_into()
+                .expect("encoded test string has a length"),
+        );
+        *input = &input[4..];
+        let length = usize::try_from(length).expect("test string length fits");
+        let (value, remainder) = input.split_at(length);
+        *input = remainder;
+        value
     }
 
     #[test]
@@ -246,16 +260,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_identity_data_and_truncated_strings() {
+    fn rejects_ambiguous_or_unbounded_requests() {
+        // Empty and unknown packets must fail instead of being interpreted as
+        // a harmless identity query by a more permissive code path.
+        assert_eq!(parse_request(&[]), Err(ProtocolError::EmptyPacket));
+        assert_eq!(parse_request(&[99]), Err(ProtocolError::UnsupportedRequest));
+
+        // Exact consumption prevents request smuggling through bytes appended
+        // after an otherwise valid identity message.
         assert_eq!(parse_request(&[11, 0]), Err(ProtocolError::TrailingData));
+
+        // A declared SSH string length must never make the parser read a
+        // partial key or payload.
         assert_eq!(
             parse_request(&[13, 0, 0, 0, 4, 1]),
             Err(ProtocolError::Truncated)
         );
+
+        // The packet bound is enforced before parsing nested strings, limiting
+        // memory and CPU use by any process that can reach the user socket.
+        let oversized = vec![11; MAX_PACKET_LENGTH + 1];
+        assert_eq!(
+            parse_request(&oversized),
+            Err(ProtocolError::PacketTooLarge)
+        );
     }
 
     #[test]
-    fn encodes_identity_and_positive_ecdsa_mpints() {
+    fn encodes_identity_response_with_the_expected_wire_shape() {
         let key = KeySummary {
             id: KeyId::new("id"),
             name: "Work".to_owned(),
@@ -264,17 +296,98 @@ mod tests {
             public_key: vec![1, 2, 3],
         };
         let identities = identities_response(&[key]).expect("encode identities");
-        assert_eq!(&identities[..9], &[0, 0, 0, 20, 12, 0, 0, 0, 1]);
 
+        // OpenSSH expects the outer frame, response type, and identity count in
+        // this exact order before the public-key and comment strings.
+        assert_eq!(&identities[..9], &[0, 0, 0, 20, 12, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn encodes_canonical_positive_ecdsa_mpints() {
         let mut raw = [0_u8; 64];
         raw[0] = 0x80;
         raw[63] = 1;
         let signature = ecdsa_signature_response(&raw).expect("encode signature");
-        assert_eq!(signature[4], 14);
+
+        let mut packet = signature.as_slice();
+        let framed_payload = take_test_string(&mut packet);
+        assert!(packet.is_empty(), "the outer frame has no trailing bytes");
+        assert_eq!(framed_payload[0], 14);
+
+        let mut response = &framed_payload[1..];
+        let mut signature_blob = take_test_string(&mut response);
         assert!(
-            signature
-                .windows(5)
-                .any(|window| window == [0, 0, 0, 33, 0])
+            response.is_empty(),
+            "the sign response contains one signature blob"
         );
+        assert_eq!(
+            take_test_string(&mut signature_blob),
+            b"ecdsa-sha2-nistp256"
+        );
+        let mut scalars = take_test_string(&mut signature_blob);
+        assert!(signature_blob.is_empty());
+
+        let r = take_test_string(&mut scalars);
+        let s = take_test_string(&mut scalars);
+        assert!(scalars.is_empty());
+
+        // An unsigned TPM scalar with its high bit set needs a zero prefix so
+        // SSH's signed mpint representation remains positive.
+        assert_eq!(r.len(), 33);
+        assert_eq!(r[0], 0);
+        assert_eq!(r[1], 0x80);
+
+        // Leading zeroes are stripped from positive scalars to keep the mpint
+        // canonical and acceptable to strict OpenSSH decoders.
+        assert_eq!(s, &[1]);
+    }
+
+    #[test]
+    fn encodes_zero_scalars_and_rejects_wrong_signature_lengths() {
+        let signature = ecdsa_signature_response(&[0; 64]).expect("encode zero scalars");
+        let mut packet = signature.as_slice();
+        let framed_payload = take_test_string(&mut packet);
+        let mut response = &framed_payload[1..];
+        let mut signature_blob = take_test_string(&mut response);
+        let _algorithm = take_test_string(&mut signature_blob);
+        let mut scalars = take_test_string(&mut signature_blob);
+
+        // SSH represents zero as an empty mpint, not as a one-byte zero. This
+        // is important even though a real ECDSA signature cannot contain zero.
+        assert!(take_test_string(&mut scalars).is_empty());
+        assert!(take_test_string(&mut scalars).is_empty());
+
+        // The TPM backend contract is a fixed r||s encoding. Accepting any
+        // other size could silently split the two components at the wrong byte.
+        assert_eq!(
+            ecdsa_signature_response(&[0; 63]),
+            Err(ProtocolError::InvalidSignature)
+        );
+        assert_eq!(
+            ecdsa_signature_response(&[0; 65]),
+            Err(ProtocolError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn bounds_responses_and_uses_the_standard_failure_frame() {
+        let oversized_key = KeySummary {
+            id: KeyId::new("large"),
+            name: "Large".to_owned(),
+            algorithm: KeyAlgorithm::EcdsaNistP256,
+            use_policy: KeyUsePolicy::NoPin,
+            public_key: vec![0; MAX_PACKET_LENGTH],
+        };
+
+        // Response bounds are as important as request bounds because persisted
+        // records are not trusted to fit into a single agent packet.
+        assert_eq!(
+            identities_response(&[oversized_key]),
+            Err(ProtocolError::PacketTooLarge)
+        );
+
+        // Unsupported and failed operations use the exact RFC agent failure
+        // packet that OpenSSH understands.
+        assert_eq!(failure_response(), [0, 0, 0, 1, 5]);
     }
 }
