@@ -76,9 +76,10 @@ and explicit stdin paths for headless and automated operation.
 3. Run focused tests first, then `cargo test --workspace`.
 4. Run `cargo clippy --workspace --all-targets -- -D warnings` before release.
 5. Validate systemd units after editing service files.
-6. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
+6. Build with Cargo directly. Do not add Makefile, Meson, or Ninja wrappers.
+7. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
    must never clear, take ownership of, or evict unrelated persistent objects.
-7. Create Git commits at frequent, meaningful checkpoints with
+8. Create Git commits at frequent, meaningful checkpoints with
    `git commit -m "<message>"`. Each commit should contain one coherent,
    reviewed change and use a concise message that describes the outcome.
    Commit after the relevant focused checks pass; do not mix unrelated,

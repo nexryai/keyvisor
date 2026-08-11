@@ -1,11 +1,7 @@
 # Fedora COPR packaging
 
-The repository supports two COPR workflows:
-
-1. build an SRPM locally and upload it directly;
-2. let COPR clone a Git repository and run `.copr/Makefile`.
-
-Both workflows produce two deterministic source archives. The first contains
+The repository builds an SRPM locally for direct upload to COPR. The packaging
+script produces two deterministic source archives. The first contains
 Keyvisor without the read-only `secretive/` reference tree. The second contains
 all crates from `Cargo.lock`, including Cargo checksum metadata. The actual RPM
 build is therefore offline and always uses the locked dependency graph.
@@ -16,7 +12,7 @@ Install the packaging tools and native build dependencies:
 
 ```sh
 sudo dnf install \
-  cargo copr-cli gcc meson mock openssh-clients pkgconf-pkg-config \
+  cargo copr-cli gcc mock openssh-clients pkgconf-pkg-config \
   pinentry-gnome3 rpm-build rust swtpm systemd-rpm-macros tpm2-tss-devel xz
 ```
 
@@ -32,7 +28,7 @@ sudo usermod -aG mock "$USER"
 Run from the repository root:
 
 ```sh
-./build-aux/make-srpm.sh dist
+./build-aux/srpm.sh dist
 rpm -qpi dist/keyvisor-0.1.0-1*.src.rpm
 ```
 
@@ -60,39 +56,6 @@ copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
 For a project owned by the logged-in user, `keyvisor` can be used instead of
 `OWNER/keyvisor`.
 
-## Build from Git with COPR SCM
-
-This workflow becomes available after the project is placed in a public Git
-repository. Add the package definition once:
-
-```sh
-copr-cli add-package-scm OWNER/keyvisor \
-  --name keyvisor \
-  --clone-url https://EXAMPLE/OWNER/keyvisor.git \
-  --commit main \
-  --spec keyvisor.spec \
-  --method make_srpm \
-  --webhook-rebuild on
-```
-
-Trigger a build:
-
-```sh
-copr-cli build-package OWNER/keyvisor --name keyvisor
-```
-
-The equivalent COPR web settings are:
-
-- source type: SCM;
-- clone URL: the public Git clone URL;
-- committish: `main` or a release tag;
-- subdirectory: empty;
-- spec file: `keyvisor.spec`;
-- source build method: `make_srpm`.
-
-The SCM source stage has network access and vendors the locked crates. COPR
-then rebuilds the generated SRPM in each selected, network-isolated chroot.
-
 ## Install from COPR
 
 After a successful build:
@@ -111,8 +74,7 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
 
 ## Release checklist
 
-- Keep `Version` synchronized in `Cargo.toml`, `meson.build`, and
-  `keyvisor.spec`.
+- Keep `Version` synchronized in `Cargo.toml` and `keyvisor.spec`.
 - Bump `Release` for packaging-only changes.
 - Update `%changelog`.
 - Commit `Cargo.lock`; never build a release with an unlocked dependency graph.

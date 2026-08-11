@@ -8,10 +8,6 @@ version=$(
         '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' \
         "${project_root}/Cargo.toml"
 )
-meson_version=$(
-    sed -n "s/^[[:space:]]*version: '\\([^']*\\)',/\\1/p" \
-        "${project_root}/meson.build"
-)
 spec_version=$(
     sed -n 's/^Version:[[:space:]]*//p' "${project_root}/keyvisor.spec"
 )
@@ -20,8 +16,8 @@ if [[ -z ${version} ]]; then
     echo "Could not read the workspace version from Cargo.toml." >&2
     exit 1
 fi
-if [[ ${meson_version} != "${version}" || ${spec_version} != "${version}" ]]; then
-    echo "Cargo.toml, meson.build, and keyvisor.spec versions must match." >&2
+if [[ ${spec_version} != "${version}" ]]; then
+    echo "Cargo.toml and keyvisor.spec versions must match." >&2
     exit 1
 fi
 

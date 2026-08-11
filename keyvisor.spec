@@ -15,7 +15,6 @@ ExclusiveArch:  x86_64 aarch64 armv7hl
 BuildRequires:  cargo >= 1.92
 BuildRequires:  rust >= 1.92
 BuildRequires:  gcc
-BuildRequires:  meson >= 1.3.0
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(systemd)
 BuildRequires:  pkgconfig(tss2-esys) >= 2.4.6
@@ -45,11 +44,19 @@ export CARGO_HOME="%{_builddir}/keyvisor-cargo-home"
 export CARGO_NET_OFFLINE=true
 export CARGO_PROFILE_RELEASE_DEBUG=2
 export CARGO_TARGET_DIR="%{_topdir}/cargo-target"
-%meson -Dcargo-profile=release
-%meson_build
+cargo build --locked --offline --workspace --release
 
 %install
-%meson_install
+install -Dm0755 "%{_topdir}/cargo-target/release/keyvisor" \
+    "%{buildroot}%{_bindir}/keyvisor"
+install -Dm0755 "%{_topdir}/cargo-target/release/keyvisor-agent" \
+    "%{buildroot}%{_bindir}/keyvisor-agent"
+sed 's|@bindir@|%{_bindir}|' data/me.nexryai.keyvisor-agent.service.in \
+    > me.nexryai.keyvisor-agent.service
+install -Dm0644 me.nexryai.keyvisor-agent.service \
+    "%{buildroot}%{_userunitdir}/me.nexryai.keyvisor-agent.service"
+install -Dm0644 data/me.nexryai.keyvisor-agent.socket \
+    "%{buildroot}%{_userunitdir}/me.nexryai.keyvisor-agent.socket"
 
 %check
 export CARGO_HOME="%{_builddir}/keyvisor-cargo-home"

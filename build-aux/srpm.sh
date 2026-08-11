@@ -23,7 +23,7 @@ mkdir -p -- \
     "${rpm_topdir}/SPECS" \
     "${rpm_topdir}/SRPMS"
 
-"${project_root}/build-aux/make-dist.sh" "${output_dir}"
+"${project_root}/build-aux/dist.sh" "${output_dir}"
 
 # Keeping SOURCES and SRPMS together makes the result easy to upload to COPR.
 rpmbuild \

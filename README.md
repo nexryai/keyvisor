@@ -25,7 +25,7 @@ the native build tools:
 
 ```sh
 sudo dnf install \
-  cargo clippy gcc meson openssh-clients pinentry-gnome3 pkgconf-pkg-config \
+  cargo clippy gcc openssh-clients pinentry-gnome3 pkgconf-pkg-config \
   rust rustfmt swtpm systemd tpm2-tss-devel
 ```
 
@@ -41,7 +41,7 @@ sudo dnf install copr-cli mock rpm-build rpmlint systemd-rpm-macros xz
 ## Build
 
 ```sh
-cargo build -p keyvisor-cli -p keyvisor-agent
+cargo build --workspace
 ```
 
 This produces `target/debug/keyvisor` and `target/debug/keyvisor-agent`.
@@ -179,9 +179,9 @@ work.
 Build and upload a network-independent SRPM with:
 
 ```sh
-./build-aux/make-srpm.sh dist
+./build-aux/srpm.sh dist
 copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
 ```
 
-See [packaging/README.md](packaging/README.md) for clean `mock` builds, direct
-uploads, and COPR SCM configuration.
+See [packaging/README.md](packaging/README.md) for clean `mock` builds and COPR
+uploads.
