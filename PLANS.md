@@ -198,8 +198,8 @@ tests are complete.
 - [x] remove the desktop entry, AppStream desktop component, application icons,
   screenshots, notifications, and GUI launch/install rules;
 - [x] remove the UI-oriented D-Bus management API after CLI parity exists;
-- [x] use Cargo directly for builds and RPM packaging, with no Makefile or
-  Meson layer;
+- [x] use Cargo directly for builds and RPM packaging, with no Meson or general
+  Makefile layer; retain only COPR's required `.copr/Makefile` adapter;
 - [x] verify that no GUI process or toolkit is required at build time or runtime.
 
 ### M4 — hardening and release

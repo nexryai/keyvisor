@@ -1,7 +1,8 @@
 # Fedora COPR packaging
 
-The repository builds an SRPM locally for direct upload to COPR. The packaging
-script produces two deterministic source archives. The first contains
+The repository supports local SRPM uploads and Git-based builds from the COPR
+Web UI. Both paths use the same packaging script, which produces two
+deterministic source archives. The first contains
 Keyvisor without the read-only `secretive/` reference tree. The second contains
 all crates from `Cargo.lock`, including Cargo checksum metadata. The actual RPM
 build is therefore offline and always uses the locked dependency graph.
@@ -55,6 +56,29 @@ copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
 
 For a project owned by the logged-in user, `keyvisor` can be used instead of
 `OWNER/keyvisor`.
+
+## Build from Git in the COPR Web UI
+
+Push the repository to a publicly readable Git URL, then open the COPR project
+and select **New Build**. Choose **SCM** and enter:
+
+- Clone URL: the repository's HTTPS clone URL;
+- Committish: `main`, or the release tag or commit to build;
+- Subdirectory: leave empty;
+- Spec File: `keyvisor.spec`;
+- SCM type: `git`;
+- Build method: `make srpm`.
+
+Submit the form after selecting the desired chroots. COPR invokes the sole
+Makefile adapter as:
+
+```sh
+make -f .copr/Makefile srpm outdir="..." spec="keyvisor.spec"
+```
+
+The adapter installs only the SRPM-generation tools and delegates to
+`build-aux/srpm.sh`. The resulting binary RPM build remains offline and runs
+Cargo directly from `keyvisor.spec`; Make is not part of the project build.
 
 ## Install from COPR
 

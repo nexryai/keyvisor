@@ -76,7 +76,9 @@ and explicit stdin paths for headless and automated operation.
 3. Run focused tests first, then `cargo test --workspace`.
 4. Run `cargo clippy --workspace --all-targets -- -D warnings` before release.
 5. Validate systemd units after editing service files.
-6. Build with Cargo directly. Do not add Makefile, Meson, or Ninja wrappers.
+6. Build with Cargo directly. Do not add Meson, Ninja, or general Makefile
+   wrappers. `.copr/Makefile` is the only exception and must remain a thin
+   adapter for COPR's `make_srpm` source method.
 7. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
    must never clear, take ownership of, or evict unrelated persistent objects.
 8. Create Git commits at frequent, meaningful checkpoints with

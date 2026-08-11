@@ -184,4 +184,4 @@ copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
 ```
 
 See [packaging/README.md](packaging/README.md) for clean `mock` builds and COPR
-uploads.
+uploads, including Git-based builds from the COPR Web UI.
