@@ -157,11 +157,7 @@ impl ConfigStore {
 
 fn create_temporary_file(parent: &Path) -> Result<(PathBuf, fs::File), ConfigError> {
     for attempt in 0..100_u8 {
-        let path = parent.join(format!(
-            ".config.{}.{}.tmp",
-            std::process::id(),
-            attempt
-        ));
+        let path = parent.join(format!(".config.{}.{}.tmp", std::process::id(), attempt));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)

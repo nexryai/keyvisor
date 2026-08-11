@@ -22,8 +22,8 @@ use keyvisor_agent::{
 };
 use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
 use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmSigner};
-use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
 use rustix::process::geteuid;
+use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -407,9 +407,7 @@ fn connect_control() -> Result<UnixStream, String> {
     if !metadata.file_type().is_socket() {
         return Err(String::from("control socket path is not a Unix socket"));
     }
-    if metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.uid() != geteuid().as_raw()
-    {
+    if metadata.permissions().mode() & 0o777 != 0o600 || metadata.uid() != geteuid().as_raw() {
         return Err(String::from(
             "control socket must be owned by the current user with mode 0600",
         ));
