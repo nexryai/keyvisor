@@ -42,13 +42,8 @@ member.
   and calls into the TPM signer.
 - `keyvisor-cli`: command-line key/configuration management and agent status
   client. It must not depend on a graphical toolkit.
-- `data`: systemd user service and socket files. Desktop integration,
-  AppStream metadata, and icons are transitional and must be removed with the
-  retired GUI.
+- `data`: systemd user service and socket files only.
 
-Do not add new features to `keyvisor-ui`; it is scheduled for complete removal.
-Until `keyvisor-cli` exists, keep transitional management commands narrowly
-scoped and do not treat the retired UI as the target architecture.
 Keep the CLI and agent responsibilities separate. A control API must carry only
 the minimum data required for its operation, use owner-only local transport,
 validate peers, and never carry raw SSH signing payloads. PIN transport requires
@@ -75,8 +70,7 @@ variables, persistent storage, or logs.
 2. Format with `cargo fmt --all -- --check`.
 3. Run focused tests first, then `cargo test --workspace`.
 4. Run `cargo clippy --workspace --all-targets -- -D warnings` before release.
-5. Validate systemd units after editing service files. During GUI retirement,
-   validate desktop and AppStream files until they are removed.
+5. Validate systemd units after editing service files.
 6. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
    must never clear, take ownership of, or evict unrelated persistent objects.
 7. Create Git commits at frequent, meaningful checkpoints with

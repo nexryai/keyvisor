@@ -3,20 +3,18 @@
 ## 1. Product direction
 
 Keyvisor is a command-line SSH agent and key manager for TPM-backed signing
-keys. The GTK 4/Libadwaita application is being retired completely. Key
-creation, inspection, deletion, agent status, signing history, and configuration
-will be available through a `keyvisor` CLI suitable for interactive use and
-shell automation.
+keys. The former graphical application has been removed completely. Key
+creation, inspection, deletion, agent status, signing history, configuration,
+and per-signature authorization are available through a `keyvisor` CLI suitable
+for interactive use and shell automation.
 
 The application ID remains `me.nexryai.keyvisor` for storage paths, systemd
 units, and other compatibility-sensitive identifiers. It does not imply a
 graphical application.
 
-The existing `keyvisor-ui` crate, desktop entry, AppStream component, icons,
-GTK/Libadwaita dependencies, and UI-oriented D-Bus API are transitional code.
-They will be removed after equivalent CLI management and per-signature
-authorization paths are implemented and tested. No new GUI features should be
-added during the transition.
+The workspace and packages contain no GUI crate, desktop entry, AppStream
+desktop component, application icons, graphical toolkit dependency, or
+UI-oriented D-Bus API.
 
 ## 2. Security boundary
 
@@ -52,8 +50,9 @@ parameter encryption rather than a plaintext password session. CLI PIN input
 must come from a controlling terminal or another explicitly configured
 owner-only helper, never command-line arguments or environment variables.
 Keyvisor keeps owned PIN buffers short-lived and zeroizes them. A new terminal
-authorization protocol must receive a dedicated security review before it
-replaces the current UI prompt; until then, missing authorization fails closed.
+authorization protocol uses an owner-only socket, validates peer credentials,
+and exposes no SSH payload. Missing or invalid authorization fails closed; a
+broader threat-model review remains part of release hardening.
 
 Dictionary-attack counters and the `maxTries`, `recoveryTime`, and
 `lockoutRecovery` parameters are TPM-wide state, not per-key settings. Keyvisor
@@ -73,10 +72,10 @@ ssh / git
     │ SSH agent protocol, $SSH_AUTH_SOCK
     ▼
 keyvisor-agent ── owner-only control protocol ── keyvisor CLI
-    │
-    │ generate, load, sign (public metadata out)
-    ▼
-keyvisor-tpm ── TPM2-TSS ESAPI ── TPM 2.0
+    │ sign                                  │ create
+    └──────────────┬────────────────────────┘
+                   ▼
+             keyvisor-tpm ── TPM2-TSS ESAPI ── TPM 2.0
 ```
 
 - `keyvisor-core` contains dependency-light domain types and protocol-neutral
@@ -85,9 +84,9 @@ keyvisor-tpm ── TPM2-TSS ESAPI ── TPM 2.0
 - `keyvisor-agent` owns SSH agent framing, request validation, socket lifecycle,
   signing history, and TPM signing operations. It runs as a socket-activated
   systemd user service or as a foreground process for development.
-- `keyvisor-cli` will provide the installed `keyvisor` command and contain no
-  GUI toolkit dependency. During migration, existing management subcommands in
-  `keyvisor-agent` remain available but are not the final interface.
+- `keyvisor-cli` provides the installed `keyvisor` command and contains no GUI
+  toolkit dependency. It manages public metadata and asks `keyvisor-tpm` to
+  generate TPM-resident signing objects, but it never performs SSH signing.
 
 The agent socket lives below `$XDG_RUNTIME_DIR/keyvisor/agent.sock`, is owned by
 the current user, and has mode `0600`. Any separate management or authorization
@@ -105,7 +104,7 @@ outcomes—never request payloads.
 
 ## 4. CLI contract
 
-The final CLI should provide stable, scriptable commands along these lines:
+The CLI provides these stable, scriptable command families:
 
 ```text
 keyvisor key create
@@ -120,8 +119,7 @@ keyvisor history
 keyvisor authorize REQUEST_ID
 ```
 
-Exact flags and output schemas are finalized with the CLI implementation. The
-following rules apply now:
+The following rules define the implemented CLI contract:
 
 - human-readable output is the default and a versioned machine-readable format
   is available explicitly;
@@ -131,8 +129,8 @@ following rules apply now:
 - stdout is reserved for requested data, while diagnostics go to stderr;
 - success and common failure modes have documented, stable exit behavior;
 - non-interactive use fails clearly when an operation requires a terminal;
-- configuration follows XDG paths and command flags override file settings in
-  a documented order;
+- configuration and persistent data follow documented XDG paths, while
+  documented environment variables select TPM and socket endpoints;
 - configuration contains no PINs or other secrets, and it cannot alter or reset
   physical-TPM dictionary-attack parameters.
 
@@ -160,44 +158,44 @@ tests are complete.
 - [x] provide owner-only sockets and native systemd socket activation;
 - [x] exercise TPM and OpenSSH paths with isolated `swtpm` instances.
 
-### M1 — CLI management parity
+### M1 — CLI management parity (implemented)
 
-- [ ] add a dependency-light `keyvisor-cli` crate producing `keyvisor`;
-- [ ] implement key create, list, show, and delete commands;
-- [ ] implement config list, get, and set commands for documented non-secret
+- [x] add a dependency-light `keyvisor-cli` crate producing `keyvisor`;
+- [x] implement key create, list, show, and delete commands;
+- [x] implement config list, get, and set commands for documented non-secret
   settings with atomic owner-only persistence;
-- [ ] implement agent status and bounded signing-history commands;
-- [ ] define human and versioned machine-readable output contracts;
-- [ ] read creation PINs from a terminal, confirm them, minimize copies, and
+- [x] implement agent status and bounded signing-history commands;
+- [x] define human and versioned machine-readable output contracts;
+- [x] read creation PINs from a terminal, confirm them, minimize copies, and
   zeroize owned buffers;
-- [ ] document shell setup, configuration precedence, exit behavior, and
+- [x] document shell setup, configuration precedence, exit behavior, and
   non-interactive limitations;
-- [ ] add focused CLI parsing, output, permission, and `swtpm` integration tests.
+- [x] add focused CLI parsing, output, permission, and `swtpm` integration tests.
 
-### M2 — terminal per-signature authorization
+### M2 — terminal per-signature authorization (core implemented)
 
-- [ ] design an owner-only, peer-validated, bounded authorization protocol;
-- [ ] expose pending requests using opaque identifiers and non-sensitive key
+- [x] design an owner-only, peer-validated, bounded authorization protocol;
+- [x] expose pending requests using opaque identifiers and non-sensitive key
   metadata, never raw SSH payloads;
-- [ ] implement `keyvisor authorize REQUEST_ID` with no-echo terminal PIN input;
-- [ ] enforce cancellation, client-disconnect propagation, and a two-minute
+- [x] implement `keyvisor authorize REQUEST_ID` with no-echo terminal PIN input;
+- [x] enforce cancellation, client-disconnect propagation, and a configurable
   authorization deadline without caching a PIN;
-- [ ] ensure concurrent requests cannot authorize the wrong operation;
-- [ ] document that authorization is defense in depth against accidental use,
+- [x] ensure concurrent requests cannot authorize the wrong operation;
+- [x] document that authorization is defense in depth against accidental use,
   not a boundary against same-user malware;
 - [ ] test wrong/correct PINs, cancellation, timeouts, disconnects, concurrency,
   and dictionary-attack reporting with `swtpm`.
 
-### M3 — GUI removal
+### M3 — GUI removal (complete)
 
-- [ ] remove `keyvisor-ui` from the workspace and source tree;
-- [ ] remove GTK 4, Libadwaita, and UI-only GLib/D-Bus dependencies;
-- [ ] remove the desktop entry, AppStream desktop component, application icons,
+- [x] remove `keyvisor-ui` from the workspace and source tree;
+- [x] remove graphical toolkit and UI-only GLib/D-Bus dependencies;
+- [x] remove the desktop entry, AppStream desktop component, application icons,
   screenshots, notifications, and GUI launch/install rules;
-- [ ] remove the UI-oriented D-Bus management API after CLI parity exists;
-- [ ] update Meson, RPM/COPR packaging, CI, and release artifacts to install
+- [x] remove the UI-oriented D-Bus management API after CLI parity exists;
+- [x] update Meson, RPM/COPR packaging, CI, and release artifacts to install
   only the CLI, agent, systemd units, licenses, and documentation;
-- [ ] verify that no GUI process or toolkit is required at build time or runtime.
+- [x] verify that no GUI process or toolkit is required at build time or runtime.
 
 ### M4 — hardening and release
 

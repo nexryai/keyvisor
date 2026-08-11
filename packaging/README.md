@@ -1,12 +1,5 @@
 # Fedora COPR packaging
 
-> **Transition note:** Keyvisor is moving to a CLI-only product. The current
-> RPM still builds and installs the retired GUI and therefore still needs GTK,
-> Libadwaita, desktop-file, and AppStream tooling. These dependencies and
-> desktop artifacts will be removed from the spec when CLI management and
-> terminal per-signature authorization reach parity. Do not add new GUI
-> packaging features.
-
 The repository supports two COPR workflows:
 
 1. build an SRPM locally and upload it directly;
@@ -23,9 +16,8 @@ Install the packaging tools and native build dependencies:
 
 ```sh
 sudo dnf install \
-  appstream cargo copr-cli desktop-file-utils gcc gtk4-devel \
-  libadwaita-devel meson mock pkgconf-pkg-config rpm-build \
-  rust swtpm systemd-rpm-macros tpm2-tss-devel xz
+  cargo copr-cli gcc meson mock openssh-clients pkgconf-pkg-config \
+  rpm-build rust swtpm systemd-rpm-macros tpm2-tss-devel xz
 ```
 
 The account used for local `mock` builds must be in the `mock` group. Log out
@@ -127,7 +119,5 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
 - Run `cargo fmt`, `cargo clippy`, and the workspace tests before building.
 - Inspect the SRPM source list to confirm `secretive/` is absent.
 - Build with `mock` for every enabled COPR architecture and Fedora release.
-- While the CLI transition is incomplete, verify that the package contents
-  match the current milestone in `PLANS.md`; the final package must not contain
-  GTK/Libadwaita dependencies, a desktop entry, AppStream desktop metadata, or
-  application icons.
+- Inspect the binary package to confirm it contains only the CLI, agent,
+  systemd user units, licenses, and documentation.
