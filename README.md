@@ -32,6 +32,34 @@ sudo dnf install \
 Keyvisor requires Rust 1.92 or newer. The integration tests start isolated
 `swtpm` processes and never use the host's physical TPM.
 
+On Fedora, add the account that runs Keyvisor to the `tss` group so it can use
+the kernel TPM resource manager:
+
+```sh
+sudo usermod -aG tss "$USER"
+```
+
+Log out completely and log back in before continuing; opening another terminal
+may not refresh supplementary groups. Verify both membership and device access:
+
+```sh
+id
+ls -l /dev/tpm0 /dev/tpmrm0
+test -r /dev/tpmrm0 && test -w /dev/tpmrm0
+```
+
+If automatic TCTI selection still chooses the raw TPM device, explicitly use
+the resource manager in the current shell before running Keyvisor:
+
+```sh
+export TPM2TOOLS_TCTI=device:/dev/tpmrm0
+```
+
+Do not run Keyvisor with `sudo`, which would create root-owned state, and do not
+make `/dev/tpm0` or `/dev/tpmrm0` world-accessible. If `/dev/tpmrm0` does not
+exist, inspect `sudo journalctl -k -b | grep -i tpm` and confirm that
+`tpm2-tss` is installed before using a physical TPM.
+
 RPM and COPR packaging additionally requires:
 
 ```sh
