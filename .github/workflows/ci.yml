@@ -19,8 +19,8 @@ jobs:
     name: Rust, swtpm, and OpenSSH
     runs-on: ubuntu-latest
     container:
-      # Fedora is the supported packaging target, so CI resolves the same GTK,
-      # Libadwaita, TPM2-TSS, swtpm, and OpenSSH integration surface as users.
+      # Fedora is the supported packaging target, so CI resolves the same
+      # TPM2-TSS, swtpm, and OpenSSH integration surface as users.
       image: fedora:44
     env:
       CARGO_TERM_COLOR: always
@@ -36,8 +36,6 @@ jobs:
           clippy
           gcc
           git
-          gtk4-devel
-          libadwaita-devel
           openssh-clients
           pkgconf-pkg-config
           rust
@@ -57,7 +55,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # Unit and binary tests do not need a TPM. Running them separately keeps
-      # failures in parsing, storage, and UI state distinct from simulator
+      # failures in parsing, storage, and CLI state distinct from simulator
       # startup or external-client failures.
       - name: Run unit tests
         run: cargo test --workspace --all-features --lib --bins
@@ -73,3 +71,6 @@ jobs:
       # SSH_AUTH_SOCK and verifies the resulting SSHSIG cryptographically.
       - name: Run OpenSSH agent integration tests
         run: cargo test -p keyvisor-agent --test agent_socket -- --nocapture
+
+      - name: Run CLI integration tests
+        run: cargo test -p keyvisor-cli --test cli -- --nocapture

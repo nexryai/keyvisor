@@ -1,6 +1,6 @@
 //! Domain types shared by Keyvisor processes.
 //!
-//! This crate deliberately has no TPM or UI dependencies. In particular, it
+//! This crate deliberately has no TPM or command-line dependencies. In particular, it
 //! must not grow a type capable of containing plaintext private key material.
 
 /// Stable identifier assigned to a TPM-backed key.

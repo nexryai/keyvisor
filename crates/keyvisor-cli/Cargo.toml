@@ -1,5 +1,5 @@
 [package]
-name = "keyvisor-ui"
+name = "keyvisor-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,11 @@ name = "keyvisor"
 path = "src/main.rs"
 
 [dependencies]
-adw = { package = "libadwaita", version = "0.9.2", features = ["v1_8"] }
 base64 = "0.22.1"
-gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"] }
+keyvisor-agent = { path = "../keyvisor-agent" }
+keyvisor-core.workspace = true
+keyvisor-tpm.workspace = true
+rustix = { version = "1.1.4", features = ["process", "termios"] }
 sha2 = "0.10.9"
 zeroize = "1.8.2"
 

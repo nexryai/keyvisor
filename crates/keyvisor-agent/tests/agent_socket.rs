@@ -8,7 +8,7 @@
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     net::TcpListener,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
@@ -18,8 +18,8 @@ use std::{
 };
 
 use keyvisor_agent::KeyStore;
-use keyvisor_core::KeyUsePolicy;
-use keyvisor_tpm::EsapiTpm;
+use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
+use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmSigner};
 
 struct TestEnvironment {
     swtpm: Child,
@@ -85,53 +85,35 @@ impl TestEnvironment {
         self.root.join("runtime/keyvisor/agent.sock")
     }
 
-    fn pin_helper_path(&self) -> PathBuf {
-        self.root.join("pin-helper")
-    }
-
-    fn write_pin_helper(&self, script: &str) {
-        let path = self.pin_helper_path();
-        fs::write(&path, script).expect("write PIN helper");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("protect PIN helper");
+    fn control_path(&self) -> PathBuf {
+        self.root.join("runtime/keyvisor/control.sock")
     }
 
     fn generate(&self, name: &str, authorization: &str, pin: &[u8]) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_keyvisor-agent"))
-            .args(["generate", "--name", name, "--authorization", authorization])
-            .env("TPM2TOOLS_TCTI", &self.tcti)
-            .env("XDG_DATA_HOME", self.data_home())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start key generation");
-        child
-            .stdin
-            .take()
-            .expect("generation stdin")
-            .write_all(pin)
-            .expect("write test PIN");
-        let output = child.wait_with_output().expect("wait for key generation");
-        assert!(
-            output.status.success(),
-            "generation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // Generation prints public metadata only. A non-empty result also
-        // confirms that the CLI completed persistence after TPM generation.
-        assert!(!output.stdout.is_empty());
+        let authorization = match authorization {
+            "none" => TpmAuthorization::None,
+            "pin" => TpmAuthorization::Pin(pin),
+            _ => panic!("unexpected test authorization"),
+        };
+        let mut tpm = EsapiTpm::connect(&self.tcti).expect("connect generation TPM");
+        let (summary, object) = tpm
+            .generate(name, KeyAlgorithm::EcdsaNistP256, authorization)
+            .expect("generate test key");
+        KeyStore::new(store_directory(&self.data_home()))
+            .save(&keyvisor_agent::StoredKey { summary, object })
+            .expect("persist test key");
     }
 
     fn start_agent(&mut self) -> UnixStream {
         let socket_path = self.socket_path();
-        self.write_pin_helper("#!/bin/sh\nprintf '123456'\n");
         self.agent = Some(
             Command::new(env!("CARGO_BIN_EXE_keyvisor-agent"))
                 .arg("serve")
                 .env("TPM2TOOLS_TCTI", &self.tcti)
                 .env("XDG_DATA_HOME", self.data_home())
+                .env("XDG_CONFIG_HOME", self.root.join("config"))
                 .env("KEYVISOR_AGENT_SOCKET", &socket_path)
-                .env("KEYVISOR_PIN_HELPER_PATH", self.pin_helper_path())
+                .env("KEYVISOR_CONTROL_SOCKET", self.control_path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -156,31 +138,47 @@ impl TestEnvironment {
         command
     }
 
-    fn list_output(&self) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_keyvisor-agent"))
-            .arg("list")
-            .env("XDG_DATA_HOME", self.data_home())
-            .output()
-            .expect("run key list command");
-        assert!(
-            output.status.success(),
-            "listing failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).expect("list output is UTF-8")
+    fn delete(&self, id: &str) {
+        KeyStore::new(store_directory(&self.data_home()))
+            .delete(&keyvisor_core::KeyId::new(id))
+            .expect("delete test key");
     }
 
-    fn delete(&self, id: &str) {
-        let output = Command::new(env!("CARGO_BIN_EXE_keyvisor-agent"))
-            .args(["delete", id])
-            .env("XDG_DATA_HOME", self.data_home())
-            .output()
-            .expect("run key delete command");
-        assert!(
-            output.status.success(),
-            "deletion failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn authorize_pending(&self, pin: &[u8]) {
+        let mut request_id = None;
+        for _ in 0..100 {
+            if let Ok(mut stream) = UnixStream::connect(self.control_path()) {
+                stream.write_all(b"LIST\n").expect("list pending requests");
+                let mut reader = std::io::BufReader::new(stream);
+                let mut header = String::new();
+                reader.read_line(&mut header).expect("read pending header");
+                if header == "OK KEYVISOR-PENDING-1 1\n" {
+                    let mut request = String::new();
+                    reader
+                        .read_line(&mut request)
+                        .expect("read pending request");
+                    request_id = Some(
+                        request
+                            .split_once('\t')
+                            .expect("pending request fields")
+                            .0
+                            .to_owned(),
+                    );
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let id = request_id.expect("pending authorization appears");
+
+        let mut approval = UnixStream::connect(self.control_path()).expect("connect approval");
+        writeln!(approval, "AUTHORIZE {id} {}", pin.len()).expect("write approval header");
+        approval.write_all(pin).expect("write approval PIN");
+        let mut response = String::new();
+        std::io::BufReader::new(approval)
+            .read_line(&mut response)
+            .expect("read approval response");
+        assert_eq!(response, "OK authorized\n");
     }
 }
 
@@ -264,12 +262,6 @@ fn serves_identities_and_signs_with_both_authorization_modes() {
     environment.generate("Automation", "none", b"");
     environment.generate("Interactive", "pin", b"123456");
 
-    // The control command must expose both records without requiring TPM
-    // authorization; only public material and policy metadata are listed.
-    let listing = environment.list_output();
-    assert_eq!(listing.lines().next(), Some("KEYVISOR-LIST-1"));
-    assert_eq!(listing.lines().count(), 3);
-
     let store = KeyStore::new(store_directory(&environment.data_home()));
     let keys = store.list().expect("load generated test keys");
     assert_eq!(keys.len(), 2);
@@ -313,14 +305,21 @@ fn serves_identities_and_signs_with_both_authorization_modes() {
     let signature = send_request(&mut stream, &sign_request(&no_pin.summary.public_key));
     assert_eq!(signature[0], 14);
 
-    let pin_signature = send_request(&mut stream, &sign_request(&pin.summary.public_key));
+    let pin_public = pin.summary.public_key.clone();
+    let socket_path = environment.socket_path();
+    let signing = thread::spawn(move || {
+        let mut pin_stream = UnixStream::connect(socket_path).expect("connect PIN signing client");
+        send_request(&mut pin_stream, &sign_request(&pin_public))
+    });
+    for _ in 0..100 {
+        if environment.control_path().exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    environment.authorize_pending(b"123456");
+    let pin_signature = signing.join().expect("join PIN signing client");
     assert_eq!(pin_signature[0], 14);
-
-    // A cancelled or failed PIN prompt must fail closed with the standard
-    // agent failure response; retrying without authorization is forbidden.
-    environment.write_pin_helper("#!/bin/sh\nexit 1\n");
-    let refused = send_request(&mut stream, &sign_request(&pin.summary.public_key));
-    assert_eq!(refused, [5]);
 
     // Unsupported mutation requests and unknown public keys must not expand
     // the socket API or fall through to another signer.
@@ -338,7 +337,7 @@ fn serves_identities_and_signs_with_both_authorization_modes() {
     // Deleting a persisted key changes subsequent identity responses without
     // restarting the agent, so stale TPM objects are not advertised.
     environment.delete(pin.summary.id.as_str());
-    assert_eq!(environment.list_output().lines().count(), 2);
+    assert_eq!(store.list().expect("list after delete").len(), 1);
     let identities_after_delete = send_request(&mut stream, &[11]);
     assert_eq!(&identities_after_delete[1..5], &1_u32.to_be_bytes());
 }

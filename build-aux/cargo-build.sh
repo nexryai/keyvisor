@@ -11,14 +11,14 @@ if [ "$profile" = "release" ]; then
   CARGO_TARGET_DIR="$target_dir" cargo build \
     --locked \
     --manifest-path "$manifest" \
-    --package keyvisor-ui \
+    --package keyvisor-cli \
     --package keyvisor-agent \
     --release
 else
   CARGO_TARGET_DIR="$target_dir" cargo build \
     --locked \
     --manifest-path "$manifest" \
-    --package keyvisor-ui \
+    --package keyvisor-cli \
     --package keyvisor-agent
 fi
 

@@ -1,26 +1,5 @@
-datadir = get_option('datadir')
 systemd = dependency('systemd')
 systemd_user_unit_dir = systemd.get_variable(pkgconfig: 'systemduserunitdir')
-
-install_data(
-  'me.nexryai.keyvisor.desktop',
-  install_dir: datadir / 'applications',
-)
-
-install_data(
-  'me.nexryai.keyvisor.metainfo.xml',
-  install_dir: datadir / 'metainfo',
-)
-
-install_data(
-  'icons/hicolor/scalable/apps/me.nexryai.keyvisor.svg',
-  install_dir: datadir / 'icons/hicolor/scalable/apps',
-)
-
-install_data(
-  'icons/hicolor/symbolic/apps/me.nexryai.keyvisor-symbolic.svg',
-  install_dir: datadir / 'icons/hicolor/symbolic/apps',
-)
 
 service_configuration = configuration_data()
 service_configuration.set(

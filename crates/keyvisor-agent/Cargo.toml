@@ -6,12 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-gio = "0.22.8"
-glib = "0.22.8"
 keyvisor-core.workspace = true
 keyvisor-tpm.workspace = true
 listenfd = "1.0.2"
-rustix = { version = "1.1.4", features = ["event"] }
+rustix = { version = "1.1.4", features = ["event", "net", "process"] }
 sha2 = "0.10.9"
 zeroize = "1.8.2"
 

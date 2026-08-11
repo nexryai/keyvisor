@@ -1,73 +1,49 @@
 //! Keyvisor SSH agent process entry point.
 //!
-//! The `generate` command and the SSH-agent socket keep TPM access in this
-//! process. The service supports native systemd socket activation.
+//! The process exposes the SSH-agent socket and a separate owner-only control
+//! socket for terminal authorization. It supports native systemd activation.
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use glib::prelude::ToVariant;
 use keyvisor_agent::{
     KeyStore, StoredKey,
+    config::ConfigStore,
     history::{HistoryEntry, HistoryOutcome, HistoryStore},
     protocol::{
         AgentRequest, MAX_PACKET_LENGTH, ecdsa_signature_response, failure_response,
         identities_response, parse_request,
     },
 };
-use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
+use keyvisor_core::KeyUsePolicy;
 use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmSigner};
 use listenfd::ListenFd;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::{net::sockopt::socket_peercred, process::geteuid};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const MAX_PIN_BYTES: usize = 64;
 const MAX_CONNECTIONS: usize = 16;
-const PIN_PROMPT_TIMEOUT: Duration = Duration::from_mins(2);
-const DBUS_NAME: &str = "me.nexryai.keyvisor.Agent";
-const DBUS_PATH: &str = "/me/nexryai/keyvisor/Agent";
-const DBUS_INTERFACE: &str = "me.nexryai.keyvisor.Agent1";
-const DBUS_ERROR: &str = "me.nexryai.keyvisor.Agent.Error";
-const DBUS_XML: &str = r#"
-<node>
-  <interface name="me.nexryai.keyvisor.Agent1">
-    <method name="ListKeys">
-      <arg name="keys" type="a(sssay)" direction="out"/>
-    </method>
-    <method name="GetHistory">
-      <arg name="entries" type="a(tssss)" direction="out"/>
-    </method>
-    <method name="DeleteKey">
-      <arg name="id" type="s" direction="in"/>
-    </method>
-    <signal name="KeysChanged"/>
-    <signal name="HistoryChanged">
-      <arg name="timestamp" type="t"/>
-      <arg name="key_id" type="s"/>
-      <arg name="key_name" type="s"/>
-      <arg name="policy" type="s"/>
-      <arg name="outcome" type="s"/>
-    </signal>
-  </interface>
-</node>
-"#;
+const MAX_CONTROL_LINE_BYTES: u64 = 16 * 1024;
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
     if let Err(message) = run() {
@@ -86,71 +62,7 @@ fn run() -> Result<(), String> {
         let socket_path = default_socket_path()?;
         return serve(&socket_path);
     }
-    if arguments == [OsString::from("list")] {
-        return list_keys();
-    }
-    if let [command, id] = arguments.as_slice()
-        && command == "delete"
-    {
-        return delete_key(id);
-    }
-
-    let request = parse_generate_request(&arguments)?;
-    let pin = read_pin(request.use_policy)?;
-    let authorization = match request.use_policy {
-        KeyUsePolicy::NoPin => TpmAuthorization::None,
-        KeyUsePolicy::TpmPin => TpmAuthorization::Pin(&pin),
-    };
-
-    let mut tpm =
-        EsapiTpm::connect_default().map_err(|error| format!("cannot open the TPM: {error}"))?;
-    let (summary, object) = tpm
-        .generate(&request.name, KeyAlgorithm::EcdsaNistP256, authorization)
-        .map_err(|error| format!("cannot generate the TPM key: {error}"))?;
-    let id = summary.id.as_str().to_owned();
-    KeyStore::new(default_store_directory()?)
-        .save(&StoredKey { summary, object })
-        .map_err(|error| format!("cannot persist the wrapped TPM key: {error}"))?;
-
-    println!("{id}");
-    Ok(())
-}
-
-fn list_keys() -> Result<(), String> {
-    let keys = KeyStore::new(default_store_directory()?)
-        .list()
-        .map_err(|error| format!("cannot list wrapped TPM keys: {error}"))?;
-    let stdout = io::stdout();
-    let mut output = io::BufWriter::new(stdout.lock());
-    writeln!(output, "KEYVISOR-LIST-1")
-        .map_err(|error| format!("cannot write key list: {error}"))?;
-    for key in keys {
-        let policy = match key.summary.use_policy {
-            KeyUsePolicy::NoPin => "none",
-            KeyUsePolicy::TpmPin => "pin",
-        };
-        writeln!(
-            output,
-            "{}\t{}\t{}\t{}",
-            key.summary.id.as_str(),
-            policy,
-            hex(key.summary.name.as_bytes()),
-            hex(&key.summary.public_key),
-        )
-        .map_err(|error| format!("cannot write key list: {error}"))?;
-    }
-    output
-        .flush()
-        .map_err(|error| format!("cannot flush key list: {error}"))
-}
-
-fn delete_key(id: &OsString) -> Result<(), String> {
-    let id = id
-        .to_str()
-        .ok_or_else(|| String::from("key identifier is not valid UTF-8"))?;
-    KeyStore::new(default_store_directory()?)
-        .delete(&keyvisor_core::KeyId::new(id))
-        .map_err(|error| format!("cannot delete the wrapped TPM key: {error}"))
+    Err(String::from("usage: keyvisor-agent [serve|--version]"))
 }
 
 fn serve(socket_path: &Path) -> Result<(), String> {
@@ -160,13 +72,20 @@ fn serve(socket_path: &Path) -> Result<(), String> {
     ensure_private_directory(parent)
         .map_err(|error| format!("cannot prepare the agent socket directory: {error}"))?;
     let (listener, _socket_guard) = activated_or_bound_listener(socket_path)?;
+    let control_path = default_control_socket_path()?;
+    let (control_listener, control_guard) = bind_guarded_socket(&control_path)?;
+    let config = ConfigStore::new(default_config_path()?)
+        .load()
+        .map_err(|error| format!("cannot load configuration: {error}"))?;
     let runtime = Arc::new(AgentRuntime {
         store: KeyStore::new(default_store_directory()?),
         tpm: Mutex::new(None),
         history: Mutex::new(HistoryStore::new(default_history_path()?)),
-        events: ManagementEvents::new(),
+        history_enabled: config.history_enabled,
+        authorization_timeout: Duration::from_secs(config.authorization_timeout_seconds),
+        authorizations: Mutex::new(HashMap::new()),
     });
-    spawn_management_service(Arc::clone(&runtime))?;
+    spawn_control_service(control_listener, control_guard, Arc::clone(&runtime))?;
     let limiter = Arc::new(ConnectionLimiter::new(MAX_CONNECTIONS));
 
     for connection in listener.incoming() {
@@ -216,9 +135,12 @@ fn activated_or_bound_listener(path: &Path) -> Result<(UnixListener, Option<Sock
         }
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| format!("cannot inspect the activated Unix socket: {error}"))?;
-        if !metadata.file_type().is_socket() || metadata.permissions().mode() & 0o777 != 0o600 {
+        if !metadata.file_type().is_socket()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.uid() != geteuid().as_raw()
+        {
             return Err(String::from(
-                "activated Unix socket must be a mode 0600 socket",
+                "activated Unix socket must be owner-owned with mode 0600",
             ));
         }
         return Ok((listener, None));
@@ -241,208 +163,135 @@ struct AgentRuntime {
     store: KeyStore,
     tpm: Mutex<Option<EsapiTpm>>,
     history: Mutex<HistoryStore>,
-    events: ManagementEvents,
+    history_enabled: bool,
+    authorization_timeout: Duration,
+    authorizations: Mutex<HashMap<String, PendingAuthorization>>,
 }
 
-struct ManagementEvents {
-    // The session bus authenticates the desktop user. Only public metadata and
-    // result events are emitted on this connection; PINs, wrapped blobs, and
-    // SSH payloads never enter the management API.
-    connection: Mutex<Option<gio::DBusConnection>>,
+struct PendingAuthorization {
+    key_name: String,
+    sender: SyncSender<Zeroizing<Vec<u8>>>,
 }
 
-impl ManagementEvents {
-    const fn new() -> Self {
-        Self {
-            connection: Mutex::new(None),
-        }
-    }
-
-    fn set_connection(&self, connection: gio::DBusConnection) {
-        if let Ok(mut current) = self.connection.lock() {
-            *current = Some(connection);
-        }
-    }
-
-    fn clear_connection(&self) {
-        if let Ok(mut current) = self.connection.lock() {
-            *current = None;
-        }
-    }
-
-    fn history_changed(&self, entry: &HistoryEntry) {
-        self.emit(
-            "HistoryChanged",
-            &(
-                entry.timestamp_seconds,
-                entry.key_id.as_str(),
-                entry.key_name.as_str(),
-                policy_name(entry.use_policy),
-                outcome_name(entry.outcome),
-            )
-                .to_variant(),
-        );
-    }
-
-    fn keys_changed(&self) {
-        self.emit("KeysChanged", &().to_variant());
-    }
-
-    fn emit(&self, signal: &str, parameters: &glib::Variant) {
-        let connection = self
-            .connection
-            .lock()
-            .ok()
-            .and_then(|connection| connection.clone());
-        if let Some(connection) = connection
-            && let Err(error) =
-                connection.emit_signal(None, DBUS_PATH, DBUS_INTERFACE, signal, Some(parameters))
-        {
-            eprintln!("keyvisor-agent: cannot emit {signal}: {error}");
-        }
-    }
-}
-
-fn spawn_management_service(runtime: Arc<AgentRuntime>) -> Result<(), String> {
+fn spawn_control_service(
+    listener: UnixListener,
+    socket_guard: SocketGuard,
+    runtime: Arc<AgentRuntime>,
+) -> Result<(), String> {
     thread::Builder::new()
-        .name(String::from("keyvisor-dbus"))
+        .name(String::from("keyvisor-control"))
         .spawn(move || {
-            // Management UI is optional. Losing D-Bus must not stop identity
-            // enumeration or no-PIN signing on the SSH agent socket.
-            if let Err(error) = run_management_service(&runtime) {
-                eprintln!("keyvisor-agent: management API unavailable: {error}");
+            let _socket_guard = socket_guard;
+            let limiter = Arc::new(ConnectionLimiter::new(MAX_CONNECTIONS));
+            for connection in listener.incoming() {
+                match connection {
+                    Ok(mut stream) => {
+                        let permit = limiter.acquire();
+                        let runtime = Arc::clone(&runtime);
+                        let spawn = thread::Builder::new()
+                            .name(String::from("keyvisor-control-client"))
+                            .spawn(move || {
+                                let _permit = permit;
+                                if let Err(error) = serve_control_connection(&mut stream, &runtime)
+                                {
+                                    let _ = writeln!(stream, "ERR {error}");
+                                }
+                            });
+                        if let Err(error) = spawn {
+                            eprintln!("keyvisor-agent: cannot start a control worker: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("keyvisor-agent: cannot accept a control client: {error}");
+                    }
+                }
             }
         })
         .map(|_| ())
-        .map_err(|error| format!("cannot start the management API worker: {error}"))
+        .map_err(|error| format!("cannot start the control service: {error}"))
 }
 
-fn run_management_service(runtime: &Arc<AgentRuntime>) -> Result<(), String> {
-    let context = glib::MainContext::new();
-    context
-        .with_thread_default(|| {
-            let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
-                .map_err(|error| format!("cannot connect to the session bus: {error}"))?;
-            let node = gio::DBusNodeInfo::for_xml(DBUS_XML)
-                .map_err(|error| format!("invalid management API definition: {error}"))?;
-            let interface = node
-                .lookup_interface(DBUS_INTERFACE)
-                .ok_or_else(|| String::from("management interface definition is missing"))?;
-            let method_runtime = Arc::clone(runtime);
-            let _registration = connection
-                .register_object(DBUS_PATH, &interface)
-                .method_call(move |_, sender, _, _, method, parameters, invocation| {
-                    if sender.is_none() {
-                        invocation.return_dbus_error(
-                            DBUS_ERROR,
-                            "anonymous management calls are not accepted",
-                        );
-                        return;
-                    }
-                    dispatch_management_call(&method_runtime, method, &parameters, invocation);
-                })
-                .build()
-                .map_err(|error| format!("cannot export the management object: {error}"))?;
-            let acquired_runtime = Arc::clone(runtime);
-            let lost_runtime = Arc::clone(runtime);
-            let _owner = gio::bus_own_name_on_connection(
-                &connection,
-                DBUS_NAME,
-                gio::BusNameOwnerFlags::NONE,
-                move |connection, _| {
-                    acquired_runtime.events.set_connection(connection);
-                },
-                move |_, _| {
-                    lost_runtime.events.clear_connection();
-                },
-            );
-            glib::MainLoop::new(Some(&context), false).run();
-            Ok::<(), String>(())
-        })
-        .map_err(|error| format!("cannot acquire the D-Bus main context: {error}"))?
-}
-
-fn dispatch_management_call(
-    runtime: &AgentRuntime,
-    method: &str,
-    parameters: &glib::Variant,
-    invocation: gio::DBusMethodInvocation,
-) {
-    // Keep this API intentionally narrower than the SSH agent and TPM APIs:
-    // it exposes display-safe metadata plus explicit record deletion only.
-    let result = match method {
-        "ListKeys" => runtime
-            .store
-            .list()
-            .map_err(|error| error.to_string())
-            .map(|keys| {
-                let keys = keys
-                    .into_iter()
-                    .map(|key| {
-                        (
-                            key.summary.id.as_str().to_owned(),
-                            key.summary.name,
-                            policy_name(key.summary.use_policy).to_owned(),
-                            key.summary.public_key,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                (keys,).to_variant()
-            }),
-        "GetHistory" => runtime
-            .history
-            .lock()
-            .map_err(|_| String::from("signing history state is unavailable"))
-            .and_then(|history| history.list().map_err(|error| error.to_string()))
-            .map(|entries| {
-                let entries = entries
-                    .into_iter()
-                    .map(|entry| {
-                        (
-                            entry.timestamp_seconds,
-                            entry.key_id.as_str().to_owned(),
-                            entry.key_name,
-                            policy_name(entry.use_policy).to_owned(),
-                            outcome_name(entry.outcome).to_owned(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                (entries,).to_variant()
-            }),
-        "DeleteKey" => parameters
-            .get::<(String,)>()
-            .ok_or_else(|| String::from("invalid DeleteKey parameters"))
-            .and_then(|(id,)| {
-                runtime
-                    .store
-                    .delete(&keyvisor_core::KeyId::new(id))
-                    .map_err(|error| error.to_string())
-            })
-            .map(|()| {
-                runtime.events.keys_changed();
-                ().to_variant()
-            }),
-        _ => Err(format!("unknown management method {method}")),
-    };
-
-    match result {
-        Ok(value) => invocation.return_value(Some(&value)),
-        Err(error) => invocation.return_dbus_error(DBUS_ERROR, &error),
+fn serve_control_connection(stream: &mut UnixStream, runtime: &AgentRuntime) -> Result<(), String> {
+    let credentials = socket_peercred(&*stream)
+        .map_err(|error| format!("cannot authenticate control peer: {error}"))?;
+    if credentials.uid != geteuid() {
+        return Err(String::from("control peer is not the agent owner"));
+    }
+    let timeout = Some(Duration::from_secs(5));
+    stream.set_read_timeout(timeout).map_err(control_io)?;
+    stream.set_write_timeout(timeout).map_err(control_io)?;
+    let mut reader = BufReader::new(&mut *stream);
+    let command = read_control_line(&mut reader)?;
+    match command.as_str() {
+        "STATUS" => writeln!(reader.get_mut(), "OK running").map_err(control_io),
+        "LIST" => {
+            let pending = runtime
+                .authorizations
+                .lock()
+                .map_err(|_| String::from("authorization state is unavailable"))?
+                .iter()
+                .map(|(id, request)| (id.clone(), request.key_name.clone()))
+                .collect::<Vec<_>>();
+            writeln!(reader.get_mut(), "OK KEYVISOR-PENDING-1 {}", pending.len())
+                .map_err(control_io)?;
+            for (id, key_name) in pending {
+                writeln!(reader.get_mut(), "{id}\t{}", hex(key_name.as_bytes()))
+                    .map_err(control_io)?;
+            }
+            Ok(())
+        }
+        _ if command.starts_with("AUTHORIZE ") => {
+            let mut fields = command.split_ascii_whitespace();
+            if fields.next() != Some("AUTHORIZE") {
+                return Err(String::from("invalid authorization command"));
+            }
+            let id = fields
+                .next()
+                .ok_or_else(|| String::from("missing request identifier"))?;
+            let length = fields
+                .next()
+                .ok_or_else(|| String::from("missing PIN length"))?
+                .parse::<usize>()
+                .map_err(|_| String::from("invalid PIN length"))?;
+            if fields.next().is_some() || !(6..=MAX_PIN_BYTES).contains(&length) {
+                return Err(String::from("invalid authorization command"));
+            }
+            let mut pin = Zeroizing::new(vec![0_u8; length]);
+            reader
+                .read_exact(&mut pin)
+                .map_err(|error| format!("cannot read authorization value: {error}"))?;
+            let request = runtime
+                .authorizations
+                .lock()
+                .map_err(|_| String::from("authorization state is unavailable"))?
+                .remove(id)
+                .ok_or_else(|| String::from("authorization request is not pending"))?;
+            request
+                .sender
+                .send(pin)
+                .map_err(|_| String::from("authorization request is no longer active"))?;
+            writeln!(reader.get_mut(), "OK authorized").map_err(control_io)
+        }
+        _ => Err(String::from("unknown control command")),
     }
 }
 
-const fn policy_name(policy: KeyUsePolicy) -> &'static str {
-    match policy {
-        KeyUsePolicy::NoPin => "none",
-        KeyUsePolicy::TpmPin => "pin",
+fn read_control_line(reader: &mut impl BufRead) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_CONTROL_LINE_BYTES + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(control_io)?;
+    if bytes.last() != Some(&b'\n') || bytes.len() as u64 > MAX_CONTROL_LINE_BYTES {
+        return Err(String::from("invalid control command"));
     }
+    bytes.pop();
+    String::from_utf8(bytes).map_err(|_| String::from("control command is not UTF-8"))
 }
 
-const fn outcome_name(outcome: HistoryOutcome) -> &'static str {
-    match outcome {
-        HistoryOutcome::Succeeded => "succeeded",
-        HistoryOutcome::Failed => "failed",
-    }
+#[allow(clippy::needless_pass_by_value)]
+fn control_io(error: io::Error) -> String {
+    format!("control protocol I/O failed: {error}")
 }
 
 impl AgentRuntime {
@@ -499,7 +348,7 @@ impl AgentRuntime {
         // identities or complete its authorization while the user is typing.
         let pin = match key.summary.use_policy {
             KeyUsePolicy::NoPin => Zeroizing::new(Vec::new()),
-            KeyUsePolicy::TpmPin => prompt_for_pin(&key.summary.name, cancellation)?,
+            KeyUsePolicy::TpmPin => self.request_pin(&key.summary.name, cancellation)?,
         };
         cancellation.check()?;
         let authorization = match key.summary.use_policy {
@@ -530,6 +379,9 @@ impl AgentRuntime {
     }
 
     fn record_history(&self, key: &StoredKey, outcome: HistoryOutcome) {
+        if !self.history_enabled {
+            return;
+        }
         // Record only which key was requested and the outcome. The signed
         // bytes and their digest are intentionally absent from this structure.
         let timestamp_seconds = SystemTime::now()
@@ -551,12 +403,56 @@ impl AgentRuntime {
                     .append(entry.clone())
                     .map_err(|error| error.to_string())
             });
-        match result {
-            Ok(()) => self.events.history_changed(&entry),
-            Err(error) => {
-                eprintln!("keyvisor-agent: could not record signing history: {error}");
-            }
+        if let Err(error) = result {
+            eprintln!("keyvisor-agent: could not record signing history: {error}");
         }
+    }
+
+    fn request_pin(
+        &self,
+        key_name: &str,
+        cancellation: &RequestCancellation,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        let sequence = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{:x}-{sequence:016x}", std::process::id());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.authorizations
+            .lock()
+            .map_err(|_| String::from("authorization state is unavailable"))?
+            .insert(
+                id.clone(),
+                PendingAuthorization {
+                    key_name: key_name.to_owned(),
+                    sender,
+                },
+            );
+
+        // The SSH request stays blocked while a separate `keyvisor authorize`
+        // process obtains the PIN from its controlling terminal. Only the
+        // opaque request ID and key name are exposed; the SSH payload is not.
+        let deadline = Instant::now() + self.authorization_timeout;
+        let result = loop {
+            match receiver.try_recv() {
+                Ok(pin) => break Ok(pin),
+                Err(TryRecvError::Disconnected) => {
+                    break Err(String::from("authorization request was cancelled"));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                break Err(String::from("TPM PIN entry timed out"));
+            }
+            if cancellation.check().is_err() {
+                break Err(String::from(
+                    "TPM PIN entry cancelled because the SSH client disconnected",
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if let Ok(mut pending) = self.authorizations.lock() {
+            pending.remove(&id);
+        }
+        result
     }
 }
 
@@ -779,6 +675,25 @@ fn finish_socket_bind(path: &Path, listener: UnixListener) -> Result<UnixListene
     Ok(listener)
 }
 
+fn bind_guarded_socket(path: &Path) -> Result<(UnixListener, SocketGuard), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| String::from("control socket path has no parent directory"))?;
+    ensure_private_directory(parent)
+        .map_err(|error| format!("cannot prepare the control socket directory: {error}"))?;
+    let listener = bind_socket(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect the control socket: {error}"))?;
+    Ok((
+        listener,
+        SocketGuard {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -817,119 +732,21 @@ impl Drop for SocketGuard {
     }
 }
 
-struct GenerateRequest {
-    name: String,
-    use_policy: KeyUsePolicy,
-}
-
-fn parse_generate_request(arguments: &[OsString]) -> Result<GenerateRequest, String> {
-    if arguments.len() != 5
-        || arguments[0] != "generate"
-        || arguments[1] != "--name"
-        || arguments[3] != "--authorization"
-    {
-        return Err(String::from(
-            "usage: keyvisor-agent generate --name NAME --authorization none|pin",
-        ));
-    }
-
-    let name = arguments[2]
-        .to_str()
-        .ok_or_else(|| String::from("key name is not valid UTF-8"))?
-        .trim()
-        .to_owned();
-    if name.is_empty() || name.len() > 4 * 1024 {
-        return Err(String::from("key name must be between 1 and 4096 bytes"));
-    }
-
-    let use_policy = match arguments[4].to_str() {
-        Some("none") => KeyUsePolicy::NoPin,
-        Some("pin") => KeyUsePolicy::TpmPin,
-        _ => return Err(String::from("authorization must be either none or pin")),
-    };
-    Ok(GenerateRequest { name, use_policy })
-}
-
-fn read_pin(use_policy: KeyUsePolicy) -> Result<Zeroizing<Vec<u8>>, String> {
-    if use_policy == KeyUsePolicy::NoPin {
-        return Ok(Zeroizing::new(Vec::new()));
-    }
-
-    let mut pin = Zeroizing::new(Vec::new());
-    io::stdin()
-        .take(u64::try_from(MAX_PIN_BYTES + 1).expect("PIN limit fits u64"))
-        .read_to_end(&mut pin)
-        .map_err(|error| format!("cannot read PIN from stdin: {error}"))?;
-    if !(6..=MAX_PIN_BYTES).contains(&pin.len()) {
-        return Err(format!("PIN must be between 6 and {MAX_PIN_BYTES} bytes"));
-    }
-    Ok(pin)
-}
-
-fn prompt_for_pin(
-    key_name: &str,
-    cancellation: &RequestCancellation,
-) -> Result<Zeroizing<Vec<u8>>, String> {
-    let helper =
-        env::var_os("KEYVISOR_PIN_HELPER_PATH").unwrap_or_else(|| OsString::from("keyvisor"));
-    let mut child = Command::new(helper)
-        .args(["--authorize", key_name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| String::from("cannot start the TPM PIN prompt"))?;
-    // The helper returns the PIN through a private pipe, never an argument,
-    // environment variable, log message, or persistent desktop setting.
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| String::from("TPM PIN prompt has no private output pipe"))?;
-    let deadline = Instant::now() + PIN_PROMPT_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|_| String::from("cannot wait for the TPM PIN prompt"))?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(String::from("TPM PIN entry timed out"));
-        }
-        if cancellation.check().is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(String::from(
-                "TPM PIN entry cancelled because the SSH client disconnected",
-            ));
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    if !status.success() {
-        return Err(String::from("TPM PIN entry was cancelled"));
-    }
-    cancellation.check()?;
-    let mut pin = Zeroizing::new(Vec::new());
-    // Read one byte beyond the accepted maximum so oversized helper output is
-    // rejected instead of silently truncated into a different PIN.
-    stdout
-        .take(u64::try_from(MAX_PIN_BYTES + 1).expect("PIN limit fits u64"))
-        .read_to_end(&mut pin)
-        .map_err(|_| String::from("cannot read the TPM PIN prompt result"))?;
-    if !(6..=MAX_PIN_BYTES).contains(&pin.len()) {
-        return Err(String::from("TPM PIN prompt returned an invalid value"));
-    }
-    Ok(pin)
-}
-
 fn default_store_directory() -> Result<PathBuf, String> {
     default_data_directory().map(|path| path.join("keys"))
 }
 
 fn default_history_path() -> Result<PathBuf, String> {
     default_data_directory().map(|path| path.join("history.bin"))
+}
+
+fn default_config_path() -> Result<PathBuf, String> {
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(config_home).join("me.nexryai.keyvisor/config"));
+    }
+    let home = env::var_os("HOME")
+        .ok_or_else(|| String::from("HOME is not set; cannot locate configuration"))?;
+    Ok(PathBuf::from(home).join(".config/me.nexryai.keyvisor/config"))
 }
 
 fn default_data_directory() -> Result<PathBuf, String> {
@@ -957,6 +774,18 @@ fn default_socket_path() -> Result<PathBuf, String> {
         .join("agent.sock"))
 }
 
+fn default_control_socket_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("KEYVISOR_CONTROL_SOCKET").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let runtime_directory = env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+        String::from("XDG_RUNTIME_DIR is not set; cannot locate the control socket")
+    })?;
+    Ok(PathBuf::from(runtime_directory)
+        .join("keyvisor")
+        .join("control.sock"))
+}
+
 fn hex(value: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(value.len() * 2);
@@ -970,42 +799,13 @@ fn hex(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        ffi::OsString,
         net::Shutdown,
         os::unix::net::UnixStream,
         thread,
         time::{Duration, Instant},
     };
 
-    use keyvisor_core::KeyUsePolicy;
-
-    use super::{RequestMonitor, parse_generate_request};
-
-    #[test]
-    fn parses_pin_generate_request() {
-        let arguments = [
-            OsString::from("generate"),
-            OsString::from("--name"),
-            OsString::from("Work"),
-            OsString::from("--authorization"),
-            OsString::from("pin"),
-        ];
-        let request = parse_generate_request(&arguments).expect("parse request");
-        assert_eq!(request.name, "Work");
-        assert_eq!(request.use_policy, KeyUsePolicy::TpmPin);
-    }
-
-    #[test]
-    fn rejects_unknown_authorization() {
-        let arguments = [
-            OsString::from("generate"),
-            OsString::from("--name"),
-            OsString::from("Work"),
-            OsString::from("--authorization"),
-            OsString::from("prompt"),
-        ];
-        assert!(parse_generate_request(&arguments).is_err());
-    }
+    use super::RequestMonitor;
 
     #[test]
     fn detects_client_disconnect() {

@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "crates/keyvisor-agent",
+    "crates/keyvisor-cli",
     "crates/keyvisor-core",
     "crates/keyvisor-tpm",
-    "crates/keyvisor-ui",
 ]
 resolver = "3"
 

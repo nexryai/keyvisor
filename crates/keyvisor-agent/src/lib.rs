@@ -13,6 +13,7 @@ use std::{
 use keyvisor_core::{KeyAlgorithm, KeyId, KeySummary, KeyUsePolicy};
 use keyvisor_tpm::TpmObject;
 
+pub mod config;
 pub mod history;
 pub mod protocol;
 
