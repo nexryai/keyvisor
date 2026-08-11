@@ -8,6 +8,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::PathBuf,
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -29,6 +30,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_PIN_BYTES: usize = 64;
 const MAX_CONTROL_LINE_BYTES: u64 = 16 * 1024;
+const MAX_PINENTRY_LINE_BYTES: u64 = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretInput {
+    Auto,
+    Terminal,
+    Pinentry,
+    Stdin,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -65,7 +75,7 @@ fn print_help() {
     println!(
         "Keyvisor — TPM-backed SSH key management\n\n\
 Usage:\n  \
-  keyvisor key create --name NAME --authorization none|pin [--yes] [--pin-stdin]\n  \
+  keyvisor key create --name NAME --authorization none|pin [--yes] [--terminal|--pinentry|--pin-stdin]\n  \
   keyvisor key list [--format human|tsv]\n  \
   keyvisor key show ID\n  \
   keyvisor key delete ID [--yes]\n  \
@@ -74,7 +84,7 @@ Usage:\n  \
   keyvisor config set NAME VALUE\n  \
   keyvisor agent status\n  \
   keyvisor history [--format human|tsv]\n  \
-  keyvisor authorize [REQUEST_ID] [--pin-stdin]"
+  keyvisor authorize [REQUEST_ID] [--terminal|--pinentry|--pin-stdin]"
     );
 }
 
@@ -92,7 +102,7 @@ fn create_key(arguments: &[OsString]) -> Result<(), String> {
     let mut name = None;
     let mut policy = None;
     let mut confirmed = false;
-    let mut pin_stdin = false;
+    let mut secret_input = SecretInput::Auto;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].to_str() {
@@ -117,7 +127,15 @@ fn create_key(arguments: &[OsString]) -> Result<(), String> {
                 index += 1;
             }
             Some("--pin-stdin") => {
-                pin_stdin = true;
+                set_secret_input(&mut secret_input, SecretInput::Stdin)?;
+                index += 1;
+            }
+            Some("--pinentry") => {
+                set_secret_input(&mut secret_input, SecretInput::Pinentry)?;
+                index += 1;
+            }
+            Some("--terminal") => {
+                set_secret_input(&mut secret_input, SecretInput::Terminal)?;
                 index += 1;
             }
             _ => return Err(String::from("invalid key create arguments")),
@@ -134,30 +152,14 @@ fn create_key(arguments: &[OsString]) -> Result<(), String> {
         );
         require_confirmation("Create this no-PIN key? [y/N] ")?;
     }
-    if policy == KeyUsePolicy::NoPin && pin_stdin {
+    if policy == KeyUsePolicy::NoPin && secret_input != SecretInput::Auto {
         return Err(String::from(
-            "--pin-stdin is valid only for PIN-protected keys",
+            "PIN input options are valid only for PIN-protected keys",
         ));
     }
 
     let pin = if policy == KeyUsePolicy::TpmPin {
-        let (first, second) = if pin_stdin {
-            let stdin = io::stdin();
-            let mut input = stdin.lock();
-            (
-                read_pin_line(&mut input, "PIN")?,
-                read_pin_line(&mut input, "PIN confirmation")?,
-            )
-        } else {
-            (
-                read_secret_from_tty("TPM PIN: ")?,
-                read_secret_from_tty("Confirm TPM PIN: ")?,
-            )
-        };
-        if first.as_slice() != second.as_slice() {
-            return Err(String::from("PIN confirmation does not match"));
-        }
-        first
+        read_new_pin(&name, secret_input)?
     } else {
         Zeroizing::new(Vec::new())
     };
@@ -344,26 +346,33 @@ fn run_history(arguments: &[OsString]) -> Result<(), String> {
 
 fn run_authorize(arguments: &[OsString]) -> Result<(), String> {
     let mut id = None;
-    let mut pin_stdin = false;
+    let mut secret_input = SecretInput::Auto;
     for argument in arguments {
         if argument == "--pin-stdin" {
-            pin_stdin = true;
+            set_secret_input(&mut secret_input, SecretInput::Stdin)?;
+        } else if argument == "--pinentry" {
+            set_secret_input(&mut secret_input, SecretInput::Pinentry)?;
+        } else if argument == "--terminal" {
+            set_secret_input(&mut secret_input, SecretInput::Terminal)?;
         } else if id.is_none() {
             id = Some(os_text(argument, "request identifier")?.to_owned());
         } else {
             return Err(String::from(
-                "usage: keyvisor authorize [REQUEST_ID] [--pin-stdin]",
+                "usage: keyvisor authorize [REQUEST_ID] [--terminal|--pinentry|--pin-stdin]",
             ));
         }
     }
     let Some(id) = id else {
         return list_authorization_requests();
     };
-    let pin = if pin_stdin {
-        read_pin_line(&mut io::stdin().lock(), "PIN")?
-    } else {
-        read_secret_from_tty("TPM PIN: ")?
-    };
+    let key_name = fetch_authorization_requests()?
+        .into_iter()
+        .find_map(|(request_id, key_name)| (request_id == id).then_some(key_name))
+        .ok_or_else(|| String::from("authorization request is not pending"))?;
+    let pin = read_existing_pin(
+        &format!("SSH signature with key “{key_name}”"),
+        secret_input,
+    )?;
     let mut stream = connect_control()?;
     writeln!(stream, "AUTHORIZE {id} {}", pin.len()).map_err(control_io)?;
     stream.write_all(&pin).map_err(control_io)?;
@@ -378,6 +387,18 @@ fn run_authorize(arguments: &[OsString]) -> Result<(), String> {
 }
 
 fn list_authorization_requests() -> Result<(), String> {
+    let requests = fetch_authorization_requests()?;
+    if requests.is_empty() {
+        println!("No pending authorization requests.");
+        return Ok(());
+    }
+    for (id, name) in requests {
+        println!("{id}  {name}");
+    }
+    Ok(())
+}
+
+fn fetch_authorization_requests() -> Result<Vec<(String, String)>, String> {
     let mut stream = connect_control()?;
     stream.write_all(b"LIST\n").map_err(control_io)?;
     let header = read_control_line(&mut stream)?;
@@ -386,18 +407,15 @@ fn list_authorization_requests() -> Result<(), String> {
         .ok_or_else(|| control_error(&header))?
         .parse::<usize>()
         .map_err(|_| String::from("agent returned an invalid request count"))?;
-    if count == 0 {
-        println!("No pending authorization requests.");
-        return Ok(());
-    }
+    let mut requests = Vec::with_capacity(count);
     for _ in 0..count {
         let line = read_control_line(&mut stream)?;
         let (id, name) = line
             .split_once('\t')
             .ok_or_else(|| String::from("agent returned an invalid authorization request"))?;
-        println!("{id}  {}", decode_hex_text(name)?);
+        requests.push((id.to_owned(), decode_hex_text(name)?));
     }
-    Ok(())
+    Ok(requests)
 }
 
 fn connect_control() -> Result<UnixStream, String> {
@@ -448,6 +466,238 @@ fn control_io(error: io::Error) -> String {
     format!("control protocol I/O failed: {error}")
 }
 
+fn set_secret_input(current: &mut SecretInput, requested: SecretInput) -> Result<(), String> {
+    if *current != SecretInput::Auto {
+        return Err(String::from("PIN input options are mutually exclusive"));
+    }
+    *current = requested;
+    Ok(())
+}
+
+fn read_new_pin(key_name: &str, input: SecretInput) -> Result<Zeroizing<Vec<u8>>, String> {
+    let input = resolve_secret_input(input);
+    if input == SecretInput::Pinentry {
+        return read_secret_from_pinentry(
+            &format!("Create TPM-protected key “{key_name}”."),
+            Some("Confirm TPM PIN:"),
+        );
+    }
+
+    let (first, second) = if input == SecretInput::Stdin {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        (
+            read_pin_line(&mut reader, "PIN")?,
+            read_pin_line(&mut reader, "PIN confirmation")?,
+        )
+    } else {
+        (
+            read_secret_from_tty("TPM PIN: ")?,
+            read_secret_from_tty("Confirm TPM PIN: ")?,
+        )
+    };
+    if first.as_slice() != second.as_slice() {
+        return Err(String::from("PIN confirmation does not match"));
+    }
+    Ok(first)
+}
+
+fn read_existing_pin(context: &str, input: SecretInput) -> Result<Zeroizing<Vec<u8>>, String> {
+    match resolve_secret_input(input) {
+        SecretInput::Pinentry => {
+            read_secret_from_pinentry(&format!("Authorize TPM-protected {context}."), None)
+        }
+        SecretInput::Stdin => read_pin_line(&mut io::stdin().lock(), "PIN"),
+        SecretInput::Terminal | SecretInput::Auto => read_secret_from_tty("TPM PIN: "),
+    }
+}
+
+fn resolve_secret_input(input: SecretInput) -> SecretInput {
+    if input == SecretInput::Auto {
+        if graphical_session_available() {
+            SecretInput::Pinentry
+        } else {
+            SecretInput::Terminal
+        }
+    } else {
+        input
+    }
+}
+
+fn graphical_session_available() -> bool {
+    env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+        || env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+}
+
+fn read_secret_from_pinentry(
+    description: &str,
+    repeat_prompt: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let ok_label = if repeat_prompt.is_some() {
+        "Create"
+    } else {
+        "Authorize"
+    };
+    let mut child = Command::new("pinentry-gnome3")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot start GNOME PIN dialog: {error}"))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| String::from("GNOME PIN dialog has no command pipe"))?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| String::from("GNOME PIN dialog has no response pipe"))?;
+    let mut output = BufReader::new(output);
+
+    let result = (|| {
+        expect_pinentry_ok(&mut output)?;
+        for command in [
+            String::from("SETTIMEOUT 120"),
+            format!("SETTITLE {}", assuan_escape("Keyvisor TPM Authorization")),
+            format!("SETDESC {}", assuan_escape(description)),
+            format!("SETPROMPT {}", assuan_escape("TPM PIN:")),
+            format!("SETOK {}", assuan_escape(ok_label)),
+            format!("SETCANCEL {}", assuan_escape("Cancel")),
+        ] {
+            send_pinentry_command(&mut input, &mut output, &command)?;
+        }
+        if let Some(repeat_prompt) = repeat_prompt {
+            send_pinentry_command(
+                &mut input,
+                &mut output,
+                &format!("SETREPEAT {}", assuan_escape(repeat_prompt)),
+            )?;
+        }
+        writeln!(input, "GETPIN")
+            .and_then(|()| input.flush())
+            .map_err(|error| format!("cannot request the GNOME PIN dialog: {error}"))?;
+        read_pinentry_response(&mut output)
+    })();
+    drop(input);
+    drop(output);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for the GNOME PIN dialog: {error}"))?;
+    let pin = result?;
+    if !status.success() {
+        return Err(String::from("GNOME PIN entry was cancelled"));
+    }
+    validate_pin(pin, "PIN")
+}
+
+fn send_pinentry_command(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    command: &str,
+) -> Result<(), String> {
+    writeln!(input, "{command}")
+        .and_then(|()| input.flush())
+        .map_err(|error| format!("cannot configure the GNOME PIN dialog: {error}"))?;
+    let data = read_pinentry_response(output)?;
+    if !data.is_empty() {
+        return Err(String::from("GNOME PIN dialog returned unexpected data"));
+    }
+    Ok(())
+}
+
+fn expect_pinentry_ok(output: &mut impl BufRead) -> Result<(), String> {
+    let data = read_pinentry_response(output)?;
+    if data.is_empty() {
+        Ok(())
+    } else {
+        Err(String::from(
+            "GNOME PIN dialog returned an invalid greeting",
+        ))
+    }
+}
+
+fn read_pinentry_response(output: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut data = Zeroizing::new(Vec::new());
+    loop {
+        let line = read_bounded_line(output, MAX_PINENTRY_LINE_BYTES)?;
+        if line.starts_with(b"D ") {
+            append_assuan_data(&line[2..], &mut data)?;
+        } else if line.as_slice() == b"D" || line.starts_with(b"S ") {
+        } else if line.as_slice() == b"OK" || line.starts_with(b"OK ") {
+            return Ok(data);
+        } else if line.as_slice() == b"ERR" || line.starts_with(b"ERR ") {
+            return Err(String::from("GNOME PIN entry was cancelled"));
+        } else {
+            return Err(String::from(
+                "GNOME PIN dialog returned an invalid response",
+            ));
+        }
+    }
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    maximum: u64,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut line = Zeroizing::new(Vec::new());
+    reader
+        .take(maximum + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("cannot read the GNOME PIN dialog: {error}"))?;
+    if line.last() != Some(&b'\n') || line.len() as u64 > maximum {
+        return Err(String::from("GNOME PIN dialog response is too large"));
+    }
+    line.pop();
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(line)
+}
+
+fn append_assuan_data(input: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+    let mut index = 0;
+    while index < input.len() {
+        let byte = if input[index] == b'%' {
+            if index + 2 >= input.len() {
+                return Err(String::from(
+                    "GNOME PIN dialog returned invalid escaped data",
+                ));
+            }
+            let high = hex_digit(input[index + 1])?;
+            let low = hex_digit(input[index + 2])?;
+            index += 3;
+            (high << 4) | low
+        } else {
+            let byte = input[index];
+            index += 1;
+            byte
+        };
+        if output.len() >= MAX_PIN_BYTES {
+            output.zeroize();
+            return Err(String::from("GNOME PIN dialog returned an oversized value"));
+        }
+        output.push(byte);
+    }
+    Ok(())
+}
+
+fn assuan_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'.' | b',' | b':' | b'-' | b'_') {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push('%');
+            escaped.push(char::from(b"0123456789ABCDEF"[usize::from(byte >> 4)]));
+            escaped.push(char::from(b"0123456789ABCDEF"[usize::from(byte & 0x0f)]));
+        }
+    }
+    escaped
+}
+
 fn read_secret_from_tty(prompt: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut tty = OpenOptions::new()
         .read(true)
@@ -483,13 +733,18 @@ fn read_pin_line(reader: &mut impl BufRead, label: &str) -> Result<Zeroizing<Vec
     if pin.last() == Some(&b'\r') {
         pin.pop();
     }
-    if !(6..=MAX_PIN_BYTES).contains(&pin.len()) {
+    validate_pin(pin, label)
+}
+
+fn validate_pin(mut pin: Zeroizing<Vec<u8>>, label: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    if (6..=MAX_PIN_BYTES).contains(&pin.len()) {
+        Ok(pin)
+    } else {
         pin.zeroize();
-        return Err(format!(
+        Err(format!(
             "{label} must be between 6 and {MAX_PIN_BYTES} bytes"
-        ));
+        ))
     }
-    Ok(pin)
 }
 
 fn require_confirmation(prompt: &str) -> Result<(), String> {
@@ -573,7 +828,8 @@ fn hex_digit(byte: u8) -> Result<u8, String> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(String::from("agent returned invalid key-name encoding")),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(String::from("invalid hexadecimal encoding")),
     }
 }
 
@@ -622,7 +878,10 @@ fn control_socket_path() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputFormat, decode_hex_text, escape_tsv, parse_format, read_pin_line};
+    use super::{
+        OutputFormat, SecretInput, assuan_escape, decode_hex_text, escape_tsv, parse_format,
+        read_pin_line, read_pinentry_response, set_secret_input,
+    };
     use std::{ffi::OsString, io::Cursor};
 
     #[test]
@@ -651,5 +910,24 @@ mod tests {
     fn decodes_control_names_and_escapes_tsv() {
         assert_eq!(decode_hex_text("4b6579").expect("decode name"), "Key");
         assert_eq!(escape_tsv("a\tb\n"), "a\\tb\\n");
+    }
+
+    #[test]
+    fn parses_bounded_assuan_pinentry_data() {
+        let mut response = Cursor::new(b"D synthetic%2DPIN\nOK\n");
+        assert_eq!(
+            read_pinentry_response(&mut response)
+                .expect("decode pinentry response")
+                .as_slice(),
+            b"synthetic-PIN"
+        );
+        assert_eq!(assuan_escape("Key % name"), "Key %25 name");
+    }
+
+    #[test]
+    fn rejects_conflicting_pin_input_options() {
+        let mut input = SecretInput::Auto;
+        set_secret_input(&mut input, SecretInput::Pinentry).expect("select pinentry");
+        assert!(set_secret_input(&mut input, SecretInput::Terminal).is_err());
     }
 }

@@ -14,6 +14,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -427,9 +428,11 @@ impl AgentRuntime {
                 },
             );
 
-        // The SSH request stays blocked while a separate `keyvisor authorize`
-        // process obtains the PIN from its controlling terminal. Only the
-        // opaque request ID and key name are exposed; the SSH payload is not.
+        // A graphical user session gets a GNOME pinentry prompt automatically.
+        // Otherwise the request stays available to `keyvisor authorize` in a
+        // terminal. Only the opaque ID and key name leave this process; the SSH
+        // payload is never sent over the control channel.
+        let mut graphical_authorizer = start_graphical_authorizer(&id);
         let deadline = Instant::now() + self.authorization_timeout;
         let result = loop {
             match receiver.try_recv() {
@@ -438,6 +441,11 @@ impl AgentRuntime {
                     break Err(String::from("authorization request was cancelled"));
                 }
                 Err(TryRecvError::Empty) => {}
+            }
+            if let Some(child) = graphical_authorizer.as_mut()
+                && child.try_wait().ok().flatten().is_some()
+            {
+                graphical_authorizer = None;
             }
             if Instant::now() >= deadline {
                 break Err(String::from("TPM PIN entry timed out"));
@@ -452,7 +460,36 @@ impl AgentRuntime {
         if let Ok(mut pending) = self.authorizations.lock() {
             pending.remove(&id);
         }
+        stop_graphical_authorizer(graphical_authorizer);
         result
+    }
+}
+
+fn start_graphical_authorizer(id: &str) -> Option<Child> {
+    if !graphical_session_available() {
+        return None;
+    }
+    let executable = env::current_exe().ok()?.with_file_name("keyvisor");
+    Command::new(executable)
+        .args(["authorize", id, "--pinentry"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn graphical_session_available() -> bool {
+    env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+        || env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+}
+
+fn stop_graphical_authorizer(child: Option<Child>) {
+    if let Some(mut child) = child {
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
     }
 }
 

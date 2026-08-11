@@ -27,6 +27,7 @@ BuildRequires:  swtpm
 BuildRequires:  openssh-clients
 
 Recommends:     openssh-clients
+Recommends:     pinentry-gnome3
 
 %description
 Keyvisor is a command-line SSH agent and key manager that creates ECDSA keys

@@ -50,6 +50,11 @@ validate peers, and never carry raw SSH signing payloads. PIN transport requires
 an explicit security review and must never use D-Bus, arguments, environment
 variables, persistent storage, or logs.
 
+Keyvisor must not grow its own GUI toolkit dependency. On graphical sessions,
+secret entry may use the external `pinentry-gnome3` agent over bounded Assuan
+pipes. Do not enable pinentry's external password cache, and retain `/dev/tty`
+and explicit stdin paths for headless and automated operation.
+
 ## Source comments
 
 - Write all source-code comments and Rust documentation in English.

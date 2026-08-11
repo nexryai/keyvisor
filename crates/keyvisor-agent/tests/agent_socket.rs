@@ -114,6 +114,8 @@ impl TestEnvironment {
                 .env("XDG_CONFIG_HOME", self.root.join("config"))
                 .env("KEYVISOR_AGENT_SOCKET", &socket_path)
                 .env("KEYVISOR_CONTROL_SOCKET", self.control_path())
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())

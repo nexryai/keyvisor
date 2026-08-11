@@ -25,8 +25,8 @@ the native build tools:
 
 ```sh
 sudo dnf install \
-  cargo clippy gcc meson openssh-clients pkgconf-pkg-config rust rustfmt \
-  swtpm systemd tpm2-tss-devel
+  cargo clippy gcc meson openssh-clients pinentry-gnome3 pkgconf-pkg-config \
+  rust rustfmt swtpm systemd tpm2-tss-devel
 ```
 
 Keyvisor requires Rust 1.92 or newer. The integration tests start isolated
@@ -119,8 +119,14 @@ The SSH socket and CLI control socket are created below
 control protocol validates the connecting process UID and never transports the
 SSH signing payload.
 
-For a TPM-PIN key, an SSH or Git operation waits for terminal authorization. In
-another terminal, list the pending request and approve its opaque ID:
+For a TPM-PIN key, an SSH or Git operation waits for per-use authorization. In
+a GNOME graphical session, the agent automatically opens the system-integrated
+`pinentry-gnome3` dialog. It shows the key name and returns the PIN through the
+standard Assuan pipe protocol. Keyvisor does not use Polkit itself because
+Polkit authenticates OS privileges and cannot return a key-specific TPM PIN.
+
+In a headless session, or when automatic graphical prompting is unavailable,
+list the pending request in another terminal and approve its opaque ID:
 
 ```sh
 keyvisor authorize
@@ -132,6 +138,12 @@ over the owner-only local control socket. Requests time out according to
 `authorization-timeout-seconds` and are cancelled when the SSH client
 disconnects. Authorization is defense in depth against accidental use; it is
 not a security boundary against code already running as the same user.
+
+Interactive key creation also uses `pinentry-gnome3` automatically in a
+graphical session, including its built-in confirmation field. Use `--terminal`
+to force `/dev/tty`, `--pinentry` to require the GNOME dialog, or `--pin-stdin`
+for an explicitly non-interactive input pipe. These options are mutually
+exclusive.
 
 Check agent status and inspect privacy-preserving signing history:
 

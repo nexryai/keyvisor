@@ -17,7 +17,7 @@ Install the packaging tools and native build dependencies:
 ```sh
 sudo dnf install \
   cargo copr-cli gcc meson mock openssh-clients pkgconf-pkg-config \
-  rpm-build rust swtpm systemd-rpm-macros tpm2-tss-devel xz
+  pinentry-gnome3 rpm-build rust swtpm systemd-rpm-macros tpm2-tss-devel xz
 ```
 
 The account used for local `mock` builds must be in the `mock` group. Log out

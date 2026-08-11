@@ -14,7 +14,8 @@ graphical application.
 
 The workspace and packages contain no GUI crate, desktop entry, AppStream
 desktop component, application icons, graphical toolkit dependency, or
-UI-oriented D-Bus API.
+UI-oriented D-Bus API. Graphical sessions may use the external GNOME pinentry
+agent for system-integrated secret entry without restoring a Keyvisor GUI.
 
 ## 2. Security boundary
 
@@ -126,6 +127,8 @@ The following rules define the implemented CLI contract:
 - destructive operations require an interactive confirmation unless an
   explicit automation flag is supplied;
 - secrets are read without terminal echo and never accepted as arguments;
+- graphical sessions use `pinentry-gnome3` automatically, while headless
+  sessions use the terminal authorization workflow;
 - stdout is reserved for requested data, while diagnostics go to stderr;
 - success and common failure modes have documented, stable exit behavior;
 - non-interactive use fails clearly when an operation requires a terminal;
@@ -178,6 +181,8 @@ tests are complete.
 - [x] expose pending requests using opaque identifiers and non-sensitive key
   metadata, never raw SSH payloads;
 - [x] implement `keyvisor authorize REQUEST_ID` with no-echo terminal PIN input;
+- [x] launch GNOME pinentry automatically for graphical-session requests and
+  preserve explicit terminal and non-interactive modes;
 - [x] enforce cancellation, client-disconnect propagation, and a configurable
   authorization deadline without caching a PIN;
 - [x] ensure concurrent requests cannot authorize the wrong operation;

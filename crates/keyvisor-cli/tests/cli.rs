@@ -4,9 +4,9 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, Read, Write},
     net::TcpListener,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
     process::{Child, Command, Stdio},
     thread,
@@ -19,6 +19,70 @@ struct TestEnvironment {
     swtpm: Child,
     root: PathBuf,
     tcti: String,
+}
+
+#[test]
+fn sends_pinentry_result_through_the_owner_only_control_socket() {
+    let root = std::env::temp_dir().join(format!(
+        "keyvisor-pinentry-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos()
+    ));
+    let bin = root.join("bin");
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&bin).expect("create fake binary directory");
+    fs::create_dir_all(&runtime).expect("create fake runtime directory");
+    let pinentry = bin.join("pinentry-gnome3");
+    fs::write(
+        &pinentry,
+        "#!/bin/sh\nprintf 'OK synthetic pinentry\\n'\nwhile IFS= read -r command; do\n  case \"$command\" in\n    GETPIN) printf 'D synthetic%%2DPIN\\nOK\\n' ;;\n    *) printf 'OK\\n' ;;\n  esac\ndone\n",
+    )
+    .expect("write fake pinentry");
+    fs::set_permissions(&pinentry, fs::Permissions::from_mode(0o700))
+        .expect("protect fake pinentry");
+
+    let control = runtime.join("control.sock");
+    let listener = UnixListener::bind(&control).expect("bind fake control socket");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600))
+        .expect("protect fake control socket");
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept pending-list connection");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut command = String::new();
+        reader.read_line(&mut command).expect("read list command");
+        assert_eq!(command, "LIST\n");
+        writeln!(reader.get_mut(), "OK KEYVISOR-PENDING-1 1").expect("write pending header");
+        writeln!(reader.get_mut(), "request-1\t53796e746865746963").expect("write pending request");
+
+        let (stream, _) = listener.accept().expect("accept CLI control connection");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("read authorization header");
+        assert_eq!(header, "AUTHORIZE request-1 13\n");
+        let mut pin = [0_u8; 13];
+        reader.read_exact(&mut pin).expect("read synthetic PIN");
+        assert_eq!(&pin, b"synthetic-PIN");
+        writeln!(reader.get_mut(), "OK authorized").expect("approve request");
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_keyvisor"))
+        .args(["authorize", "request-1", "--pinentry"])
+        .env("KEYVISOR_CONTROL_SOCKET", &control)
+        .env("PATH", format!("{}:/usr/bin", bin.display()))
+        .output()
+        .expect("run graphical authorization CLI");
+    assert!(
+        output.status.success(),
+        "authorization failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("join fake control server");
+    fs::remove_dir_all(root).expect("remove pinentry test directory");
 }
 
 impl TestEnvironment {
