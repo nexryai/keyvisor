@@ -1,45 +1,60 @@
 # Keyvisor
 
-Keyvisor is a GNOME SSH agent that keeps signing keys protected by the TPM.
-Its application ID is `me.nexryai.keyvisor`.
+Keyvisor is a command-line SSH agent and key manager that keeps signing keys
+protected by a TPM 2.0 device. Its compatibility-sensitive application ID is
+`me.nexryai.keyvisor`.
 
-The TPM generation/signing backend and a Libadwaita key-creation flow are now
-implemented. Keys are generated as fixed, non-migratable TPM objects. Keyvisor
-persists only their public areas and TPM-wrapped private blobs; there is no
-software-key fallback.
+The project is transitioning from GTK 4/Libadwaita to a CLI-only design. The
+existing GUI is retired: it receives no new features and will be removed after
+the CLI covers key management, agent status, signing history, and per-signature
+authorization. The current source tree still contains transitional GUI code and
+dependencies, so this document distinguishes commands that work today from the
+target interface described in [PLANS.md](PLANS.md).
 
-At creation time, choose either:
+Keys are generated as fixed, non-migratable TPM objects. Keyvisor persists only
+their public areas and TPM-wrapped private blobs; it has no software-key
+fallback, private-key import, or private-key export path. Signing is performed
+by the TPM.
 
-- **No Authentication** for unattended agent signing. The TPM object uses an
-  empty authorization value and is excluded from dictionary-attack counting.
-- **TPM Rate-limited PIN** to require a PIN for each signature. The PIN is not
-  stored, and failed attempts use the TPM's shared lockout policy.
+At creation time, a key uses one of two authorization policies:
 
-The core SSH agent wire protocol is implemented: identity enumeration and
-ECDSA/SHA-256 signing work over an owner-only Unix socket. TPM-PIN keys open a
-fresh Libadwaita prompt for every signature; cancelling the prompt fails the
-request. The GUI loads the real TPM-key list and shows authentication policy,
-SHA-256 fingerprint, copyable OpenSSH public material, and a confirmed deletion
-flow. A Signing Activity view and desktop notifications report successful and
-failed requests without recording the signed payload. The agent supports native
-systemd socket activation and up to 16 concurrent clients while serializing TPM
-access.
+- **No PIN** permits unattended agent signing. The TPM object has an empty
+  authorization value and is excluded from dictionary-attack counting.
+- **TPM-protected PIN** requires authorization for each signature. Keyvisor
+  does not persist or cache the PIN, and failed attempts are governed by the
+  TPM's shared dictionary-attack policy.
 
-The GUI follows GNOME navigation conventions: its key sidebar collapses into
-page-based navigation below 700sp, Signing Activity opens in the main window,
-and the primary menu provides Refresh, Keyboard Shortcuts, and About actions.
-The current UI requires Libadwaita 1.8 or newer.
+The agent implements identity enumeration and ECDSA/SHA-256 signing over an
+owner-only Unix socket. It supports native systemd socket activation and up to
+16 concurrent SSH clients while serializing TPM access. Signing history records
+only bounded metadata and outcomes, never the signed payload.
 
-The agent exports a read-focused management interface on the authenticated
-per-user session bus as `me.nexryai.keyvisor.Agent1`. It exposes public key
-metadata, deletion, and the bounded activity history; it never transports PINs,
-wrapped private blobs, or SSH signing payloads. The newest 200 activity entries
-are stored in an owner-only `history.bin`.
+## Transition status
+
+Some low-level management commands already exist on `keyvisor-agent`:
+
+```text
+keyvisor-agent generate --name NAME --authorization none|pin
+keyvisor-agent list
+keyvisor-agent delete ID
+keyvisor-agent serve
+```
+
+These are transitional interfaces, not the final CLI contract. PIN input for
+`generate --authorization pin` is read from stdin and must be supplied without
+placing it in an argument, environment variable, shell history, or log.
+
+The planned installed interface is a separate `keyvisor` command with key
+create/list/show/delete, non-secret configuration, agent status, history, and
+terminal authorization subcommands. Machine-readable output and exit behavior
+will be versioned and documented before the GUI is removed. See
+[PLANS.md](PLANS.md) for milestones and security requirements.
 
 ## Fedora development dependencies
 
-Install the Rust toolchain, GNOME development libraries, TPM2-TSS headers,
-validators, and the software TPM used by the integration tests:
+The current transitional tree still builds the GUI, so GTK, Libadwaita, and
+desktop metadata validators remain build dependencies until the GUI-removal
+milestone lands:
 
 ```sh
 sudo dnf install \
@@ -48,9 +63,9 @@ sudo dnf install \
   rustfmt swtpm systemd tpm2-tss-devel
 ```
 
-Keyvisor requires Rust 1.92 or newer and Libadwaita 1.8 or newer. `swtpm` is
-required by `cargo test --workspace --all-features`; the tests start an
-isolated temporary TPM and do not use the host's physical TPM.
+Keyvisor requires Rust 1.92 or newer. `swtpm` is required by the full-featured
+workspace tests; the tests start an isolated temporary TPM and do not use the
+host's physical TPM.
 
 RPM and COPR packaging additionally requires:
 
@@ -66,14 +81,20 @@ following command, log out and back in before invoking `mock`:
 sudo usermod -aG mock "$USER"
 ```
 
-## Run the application
+## Run the current agent
 
-Build both processes so the GUI can start the agent helper, then point the
-development build at it:
+Build and run the agent directly:
 
 ```sh
-cargo build -p keyvisor-agent -p keyvisor-ui
-KEYVISOR_AGENT_PATH=target/debug/keyvisor-agent cargo run -p keyvisor-ui
+cargo build -p keyvisor-agent
+target/debug/keyvisor-agent serve
+```
+
+In another shell, point OpenSSH clients at it:
+
+```sh
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
+ssh-add -L
 ```
 
 The agent uses `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI` when set; otherwise it
@@ -81,17 +102,7 @@ opens the default TPM resource-manager device. Wrapped key records are stored
 below `$XDG_DATA_HOME/me.nexryai.keyvisor/keys`, falling back to
 `~/.local/share/me.nexryai.keyvisor/keys`.
 
-For a development agent session:
-
-```sh
-KEYVISOR_PIN_HELPER_PATH=target/debug/keyvisor target/debug/keyvisor-agent serve
-export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
-ssh-add -L
-```
-
-The Meson install includes both executables and
-`me.nexryai.keyvisor-agent.service`. After installation, the user service can
-be enabled with:
+After installation, enable socket activation with:
 
 ```sh
 systemctl --user enable --now me.nexryai.keyvisor-agent.socket
@@ -100,10 +111,12 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
 
 The socket unit starts the service on the first SSH client connection. Direct
 `keyvisor-agent serve` remains available for development and environments
-without systemd user services. If an SSH client disconnects while its PIN
-dialog is open, the agent closes the dialog and abandons the request. A
-synchronous TPM command already in progress cannot be interrupted through
-TPM2-TSS, so its result is discarded after the command returns.
+without systemd user services.
+
+The current TPM-PIN signing path still invokes the retired GUI helper. It will
+be replaced by the terminal authorization protocol in [PLANS.md](PLANS.md).
+Until that replacement is implemented, a missing or cancelled helper fails the
+signature request closed; there is no no-PIN or software-key fallback.
 
 ## Verify
 
@@ -114,27 +127,25 @@ cargo test --workspace --all-features
 ```
 
 The TPM integration test starts its own temporary `swtpm` and never touches a
-physical TPM. The agent integration suite also invokes the installed
-`ssh-add` and `ssh-keygen` clients. It confirms that OpenSSH can enumerate a
-Keyvisor identity, request a TPM-backed signature over `SSH_AUTH_SOCK`, and
-cryptographically verify the resulting SSHSIG.
+physical TPM. The agent integration suite invokes installed `ssh-add` and
+`ssh-keygen` clients to enumerate an identity, request a TPM-backed signature,
+and verify the resulting SSHSIG.
 
 GitHub Actions repeats formatting, Clippy, unit, `swtpm`, and OpenSSH checks in
-a Fedora container. The workflow installs the same test dependencies listed
-above and keeps the simulator-backed suites in separate named steps so TPM and
-wire-protocol failures are visible independently.
-
-See `PLASN.md` for the implementation plan and security model.
+a Fedora container.
 
 ## Fedora COPR
 
-Fedora RPM and COPR packaging is included. It produces a source RPM with a
-locked vendor archive so the final build does not access the network:
+The current Fedora RPM and COPR packaging includes transitional GUI artifacts.
+The GUI-removal milestone will reduce the package to the CLI, agent, systemd
+units, licenses, and documentation.
+
+Build and upload an SRPM with:
 
 ```sh
 ./build-aux/make-srpm.sh dist
 copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
 ```
 
-See `packaging/README.md` for prerequisites, clean `mock` builds, direct
-uploads, and COPR SCM configuration.
+See [packaging/README.md](packaging/README.md) for prerequisites, clean `mock`
+builds, direct uploads, and COPR SCM configuration.

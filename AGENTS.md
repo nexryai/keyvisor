@@ -29,22 +29,31 @@ member.
   them for status, but must not change or reset them on a physical TPM.
 - The SSH agent socket must be owned by the current user, use mode `0600`, and
   reject unsupported mutation and extension messages by default.
-- UI confirmation is defense in depth, not a TPM-enforced security boundary.
+- CLI confirmation is defense in depth, not a TPM-enforced security boundary.
   Do not describe it as protection against code already running as the user.
 - A failed or unavailable TPM must fail closed. Do not silently create or load
   a disk-backed private key.
 
-## Architecture
+## Target architecture
 
 - `keyvisor-core`: dependency-light domain types and protocol-neutral contracts.
 - `keyvisor-tpm`: the only crate allowed to talk to TPM2-TSS/ESAPI.
 - `keyvisor-agent`: SSH agent framing, request validation, socket lifecycle,
   and calls into the TPM signer.
-- `keyvisor-ui`: GTK 4/Libadwaita GUI and agent control/status client.
-- `data`: desktop integration, AppStream metadata, icons, and service files.
+- `keyvisor-cli`: command-line key/configuration management and agent status
+  client. It must not depend on a graphical toolkit.
+- `data`: systemd user service and socket files. Desktop integration,
+  AppStream metadata, and icons are transitional and must be removed with the
+  retired GUI.
 
-Keep the UI and agent in separate processes. Their control API must carry only
-metadata, public material, user decisions, and results.
+Do not add new features to `keyvisor-ui`; it is scheduled for complete removal.
+Until `keyvisor-cli` exists, keep transitional management commands narrowly
+scoped and do not treat the retired UI as the target architecture.
+Keep the CLI and agent responsibilities separate. A control API must carry only
+the minimum data required for its operation, use owner-only local transport,
+validate peers, and never carry raw SSH signing payloads. PIN transport requires
+an explicit security review and must never use D-Bus, arguments, environment
+variables, persistent storage, or logs.
 
 ## Source comments
 
@@ -62,11 +71,12 @@ metadata, public material, user decisions, and results.
 
 ## Development workflow
 
-1. Update `PLASN.md` when a security boundary or milestone changes.
+1. Update `PLANS.md` when a security boundary or milestone changes.
 2. Format with `cargo fmt --all -- --check`.
 3. Run focused tests first, then `cargo test --workspace`.
 4. Run `cargo clippy --workspace --all-targets -- -D warnings` before release.
-5. Validate desktop files and AppStream metadata after editing `data/`.
+5. Validate systemd units after editing service files. During GUI retirement,
+   validate desktop and AppStream files until they are removed.
 6. TPM integration tests must use `swtpm`; physical TPM tests are opt-in and
    must never clear, take ownership of, or evict unrelated persistent objects.
 7. Create Git commits at frequent, meaningful checkpoints with

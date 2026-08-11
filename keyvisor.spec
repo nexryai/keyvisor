@@ -73,7 +73,7 @@ desktop-file-validate \
 
 %files
 %license LICENSE
-%doc README.md PLASN.md
+%doc README.md PLANS.md
 %{_bindir}/keyvisor
 %{_bindir}/keyvisor-agent
 %{_datadir}/applications/me.nexryai.keyvisor.desktop
