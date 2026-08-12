@@ -1,5 +1,5 @@
 Name:           keyvisor
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Command-line TPM-backed SSH agent and key manager
 
@@ -82,5 +82,8 @@ cargo test --locked --offline --workspace --all-features
 %{_userunitdir}/me.nexryai.keyvisor-agent.socket
 
 %changelog
-* Wed Jul 29 2026 Nexryai <noreply@nexryai.me> - 0.1.0-1
+* Wed Aug 12 2026 nexryai <noreply@nexryai.me> - 0.1.1-1
+- Default to the kernel TPM resource manager
+
+* Wed Jul 29 2026 nexryai <noreply@nexryai.me> - 0.1.0-1
 - Initial COPR package
