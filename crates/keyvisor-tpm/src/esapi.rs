@@ -29,6 +29,8 @@ use tss_esapi::{
 
 use crate::{DictionaryAttackState, TpmAuthorization, TpmError, TpmObject, TpmSigner};
 
+const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
+
 /// TPM2-TSS ESAPI-backed signer.
 ///
 /// The storage parent is a deterministic primary object recreated for each
@@ -40,7 +42,7 @@ pub struct EsapiTpm {
 }
 
 impl EsapiTpm {
-    /// Connects using an explicit TCTI string such as `device` or
+    /// Connects using an explicit TCTI string such as `device:/dev/tpmrm0` or
     /// `swtpm:host=127.0.0.1,port=2321`.
     ///
     /// # Errors
@@ -79,7 +81,7 @@ impl EsapiTpm {
     }
 
     /// Connects using `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI`; otherwise uses
-    /// the default TPM resource-manager device.
+    /// the kernel TPM resource manager at `/dev/tpmrm0`.
     ///
     /// # Errors
     ///
@@ -88,7 +90,11 @@ impl EsapiTpm {
         let tcti = std::env::var("TPM2TOOLS_TCTI")
             .or_else(|_| std::env::var("TCTI"))
             .or_else(|_| std::env::var("TEST_TCTI"))
-            .unwrap_or_else(|_| String::from("device"));
+            // An unqualified `device` lets TPM2-TSS fall back to the raw
+            // `/dev/tpm0` node when resource-manager discovery fails. Using
+            // the explicit path preserves concurrent-access isolation and
+            // avoids requiring raw-device ownership.
+            .unwrap_or_else(|_| String::from(DEFAULT_TCTI));
         Self::connect(&tcti)
     }
 
@@ -424,5 +430,20 @@ fn map_tss_error(error: Error) -> TpmError {
             _ => TpmError::Transport,
         },
         Error::WrapperError(_) => TpmError::Transport,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use tss_esapi::tcti_ldr::TctiNameConf;
+
+    use super::DEFAULT_TCTI;
+
+    #[test]
+    fn default_tcti_is_the_explicit_kernel_resource_manager() {
+        assert_eq!(DEFAULT_TCTI, "device:/dev/tpmrm0");
+        assert!(TctiNameConf::from_str(DEFAULT_TCTI).is_ok());
     }
 }

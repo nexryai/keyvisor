@@ -127,6 +127,8 @@ The following rules define the implemented CLI contract:
 - destructive operations require an interactive confirmation unless an
   explicit automation flag is supplied;
 - secrets are read without terminal echo and never accepted as arguments;
+- physical TPM access defaults explicitly to the kernel resource manager at
+  `/dev/tpmrm0` and never silently falls back to raw `/dev/tpm0` access;
 - graphical sessions use `pinentry-gnome3` automatically, while headless
   sessions use the terminal authorization workflow;
 - stdout is reserved for requested data, while diagnostics go to stderr;

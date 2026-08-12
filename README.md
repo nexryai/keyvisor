@@ -48,8 +48,10 @@ ls -l /dev/tpm0 /dev/tpmrm0
 test -r /dev/tpmrm0 && test -w /dev/tpmrm0
 ```
 
-If automatic TCTI selection still chooses the raw TPM device, explicitly use
-the resource manager in the current shell before running Keyvisor:
+Keyvisor uses `/dev/tpmrm0` by default and never falls back automatically to the
+raw, single-client `/dev/tpm0` device. `TPM2TOOLS_TCTI`, `TCTI`, and `TEST_TCTI`
+remain explicit overrides for test simulators or unusual deployments. For
+example, the following selects the same kernel resource manager explicitly:
 
 ```sh
 export TPM2TOOLS_TCTI=device:/dev/tpmrm0
@@ -185,7 +187,7 @@ History contains timestamps, key metadata, authorization policy, and outcome,
 never signed payloads. TSV history begins with `KEYVISOR-HISTORY-1`.
 
 The agent uses `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI` when set; otherwise it
-opens the default TPM resource-manager device. Wrapped key records are stored
+opens `/dev/tpmrm0` explicitly. Wrapped key records are stored
 below `$XDG_DATA_HOME/me.nexryai.keyvisor/keys`, falling back to
 `~/.local/share/me.nexryai.keyvisor/keys`.
 
