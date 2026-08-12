@@ -73,8 +73,10 @@ and explicit stdin paths for headless and automated operation.
 
 1. Update `PLANS.md` when a security boundary or milestone changes.
 2. Format with `cargo fmt --all -- --check`.
-3. Run focused tests first, then `cargo test --workspace`.
-4. Run `cargo clippy --workspace --all-targets -- -D warnings` before release.
+3. Run focused tests first, then `cargo test --locked --workspace`.
+4. Run `cargo clippy --locked --workspace --all-targets -- -D warnings` before
+   release. Commit `Cargo.lock` whenever workspace versions or dependencies
+   change; COPR source generation deliberately rejects a stale lockfile.
 5. Validate systemd units after editing service files.
 6. Build with Cargo directly. Do not add Meson, Ninja, or general Makefile
    wrappers. `.copr/Makefile` is the only exception and must remain a thin

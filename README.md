@@ -195,8 +195,8 @@ below `$XDG_DATA_HOME/me.nexryai.keyvisor/keys`, falling back to
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
 The agent suite also invokes installed `ssh-add` and `ssh-keygen` clients to

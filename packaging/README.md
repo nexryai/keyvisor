@@ -101,7 +101,8 @@ export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
 - Keep `Version` synchronized in `Cargo.toml` and `keyvisor.spec`.
 - Bump `Release` for packaging-only changes.
 - Update `%changelog`.
-- Commit `Cargo.lock`; never build a release with an unlocked dependency graph.
+- Commit the refreshed `Cargo.lock` whenever the workspace version or a
+  dependency changes; COPR source generation rejects a stale lockfile.
 - Run `cargo fmt`, `cargo clippy`, and the workspace tests before building.
 - Inspect the SRPM source list to confirm `secretive/` is absent.
 - Build with `mock` for every enabled COPR architecture and Fedora release.

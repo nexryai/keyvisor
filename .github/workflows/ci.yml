@@ -51,26 +51,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # COPR vendors with --locked. Check this before any Cargo command can
+      # silently refresh workspace package versions in Cargo.lock.
+      - name: Check locked dependency graph
+        run: cargo check --locked --workspace
+
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       # Unit and binary tests do not need a TPM. Running them separately keeps
       # failures in parsing, storage, and CLI state distinct from simulator
       # startup or external-client failures.
       - name: Run unit tests
-        run: cargo test --workspace --all-features --lib --bins
+        run: cargo test --locked --workspace --all-features --lib --bins
 
       # The TPM suite starts one isolated swtpm per test. It verifies real ESAPI
       # generation/signing, authorization policy, and wrapped-object reloads;
       # it never opens the runner's physical TPM device.
       - name: Run swtpm integration tests
-        run: cargo test -p keyvisor-tpm --test swtpm -- --nocapture
+        run: cargo test --locked -p keyvisor-tpm --test swtpm -- --nocapture
 
       # This suite starts both swtpm and the real agent executable. Stock
       # ssh-add parses identities, while ssh-keygen requests a signature through
       # SSH_AUTH_SOCK and verifies the resulting SSHSIG cryptographically.
       - name: Run OpenSSH agent integration tests
-        run: cargo test -p keyvisor-agent --test agent_socket -- --nocapture
+        run: cargo test --locked -p keyvisor-agent --test agent_socket -- --nocapture
 
       - name: Run CLI integration tests
-        run: cargo test -p keyvisor-cli --test cli -- --nocapture
+        run: cargo test --locked -p keyvisor-cli --test cli -- --nocapture
