@@ -118,6 +118,7 @@ keyvisor config set NAME VALUE
 keyvisor agent status
 keyvisor history
 keyvisor authorize REQUEST_ID
+keyvisor exec -- COMMAND [ARGUMENT ...]
 ```
 
 The following rules define the implemented CLI contract:
@@ -130,7 +131,8 @@ The following rules define the implemented CLI contract:
 - physical TPM access defaults explicitly to the kernel resource manager at
   `/dev/tpmrm0` and never silently falls back to raw `/dev/tpm0` access;
 - graphical sessions use `pinentry-gnome3` automatically, while headless
-  sessions use the terminal authorization workflow;
+  sessions use the single-terminal `exec` wrapper or the explicit two-terminal
+  authorization workflow;
 - stdout is reserved for requested data, while diagnostics go to stderr;
 - success and common failure modes have documented, stable exit behavior;
 - non-interactive use fails clearly when an operation requires a terminal;
@@ -188,10 +190,14 @@ tests are complete.
 - [x] enforce cancellation, client-disconnect propagation, and a configurable
   authorization deadline without caching a PIN;
 - [x] ensure concurrent requests cannot authorize the wrong operation;
+- [x] implement `keyvisor exec -- COMMAND` with no-echo `/dev/tty` PIN entry,
+  inherited command I/O, signal forwarding, exact child exit status, and safe
+  refusal of pre-existing or ambiguous concurrent requests;
 - [x] document that authorization is defense in depth against accidental use,
   not a boundary against same-user malware;
-- [ ] test wrong/correct PINs, cancellation, timeouts, disconnects, concurrency,
-  and dictionary-attack reporting with `swtpm`.
+- [ ] test wrong PINs, timeouts, disconnects, and dictionary-attack reporting
+  with `swtpm`; terminal success, cancellation, and concurrency have automated
+  coverage.
 
 ### M3 — GUI removal (complete)
 

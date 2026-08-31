@@ -155,12 +155,29 @@ a GNOME graphical session, the agent automatically opens the system-integrated
 standard Assuan pipe protocol. Keyvisor does not use Polkit itself because
 Polkit authenticates OS privileges and cannot return a key-specific TPM PIN.
 
-In a headless session, or when automatic graphical prompting is unavailable,
-list the pending request in another terminal and approve its opaque ID:
+In a headless session, run SSH or Git through `keyvisor exec` to keep the
+operation and its PIN prompt in one terminal:
+
+```sh
+keyvisor exec -- ssh -T git@github.com
+keyvisor exec -- git fetch
+keyvisor exec -- git push
+```
+
+The command keeps the child's original stdin, stdout, and stderr, reads each
+PIN from `/dev/tty` without echo, forwards common termination signals, and
+returns the child's exit status. It starts only when no authorization request
+is already pending and refuses to choose if concurrent requests make the
+operation ambiguous. The PIN is never placed in arguments or the environment,
+persisted, or cached.
+
+The two-terminal workflow remains available when wrapping the operation is not
+practical. Start the SSH or Git operation in the first terminal. In a second
+terminal, list the pending request and approve its opaque ID:
 
 ```sh
 keyvisor authorize
-keyvisor authorize REQUEST_ID
+keyvisor authorize REQUEST_ID --terminal
 ```
 
 The second command reads the PIN without echo and sends its short-lived value

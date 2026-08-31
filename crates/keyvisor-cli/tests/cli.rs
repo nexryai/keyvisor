@@ -15,6 +15,187 @@ use std::{
 
 use keyvisor_tpm::EsapiTpm;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn exec_refuses_ambiguous_concurrent_authorizations() {
+    let root = std::env::temp_dir().join(format!(
+        "keyvisor-exec-ambiguity-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create exec ambiguity test directory");
+    let control = root.join("control.sock");
+    let listener = UnixListener::bind(&control).expect("bind fake control socket");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600))
+        .expect("protect fake control socket");
+    let server = thread::spawn(move || {
+        for count in [0, 2] {
+            let (stream, _) = listener.accept().expect("accept list connection");
+            let mut reader = std::io::BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).expect("read list command");
+            assert_eq!(command, "LIST\n");
+            writeln!(reader.get_mut(), "OK KEYVISOR-PENDING-1 {count}")
+                .expect("write pending header");
+            for request in 0..count {
+                writeln!(reader.get_mut(), "request-{request}\t4b6579")
+                    .expect("write pending request");
+            }
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_keyvisor"))
+        .args([
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; while :; do sleep 0.02; done",
+        ])
+        .env("KEYVISOR_CONTROL_SOCKET", &control)
+        .output()
+        .expect("run exec wrapper with ambiguous requests");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple authorization requests"));
+    server.join().expect("join fake control server");
+    fs::remove_dir_all(root).expect("remove exec ambiguity test directory");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exec_forwards_signals_to_the_wrapped_command() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let root = std::env::temp_dir().join(format!(
+        "keyvisor-exec-signal-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create exec signal test directory");
+    let ready = root.join("ready");
+    let shell_command = format!(
+        "trap 'exit 42' TERM; touch '{}'; while :; do sleep 0.02; done",
+        ready.display()
+    );
+    let mut wrapped = Command::new(env!("CARGO_BIN_EXE_keyvisor"))
+        .args(["exec", "--", "/bin/sh", "-c", &shell_command])
+        .env("KEYVISOR_CONTROL_SOCKET", root.join("missing.sock"))
+        .spawn()
+        .expect("start exec wrapper for signal forwarding");
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "wrapped command did not become ready");
+    thread::sleep(Duration::from_millis(100));
+    let pid = i32::try_from(wrapped.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .expect("wrapper PID fits");
+    kill_process(pid, Signal::TERM).expect("signal exec wrapper");
+    let status = wrapped.wait().expect("wait for signalled exec wrapper");
+    assert_eq!(status.code(), Some(42));
+    fs::remove_dir_all(root).expect("remove exec signal test directory");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exec_authorizes_from_its_terminal_and_preserves_command_status() {
+    use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
+
+    let root = std::env::temp_dir().join(format!(
+        "keyvisor-exec-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock follows Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create exec test directory");
+    let control = root.join("control.sock");
+    let completion = root.join("authorized");
+    let listener = UnixListener::bind(&control).expect("bind fake control socket");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600))
+        .expect("protect fake control socket");
+    let completion_for_server = completion.clone();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept preflight connection");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut command = String::new();
+        reader.read_line(&mut command).expect("read preflight list");
+        assert_eq!(command, "LIST\n");
+        writeln!(reader.get_mut(), "OK KEYVISOR-PENDING-1 0")
+            .expect("write empty preflight response");
+
+        let (stream, _) = listener.accept().expect("accept pending connection");
+        let mut reader = std::io::BufReader::new(stream);
+        command.clear();
+        reader.read_line(&mut command).expect("read pending list");
+        assert_eq!(command, "LIST\n");
+        writeln!(reader.get_mut(), "OK KEYVISOR-PENDING-1 1").expect("write pending header");
+        writeln!(reader.get_mut(), "request-1\t486561646c657373204b6579")
+            .expect("write pending request");
+
+        let (stream, _) = listener.accept().expect("accept authorization connection");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("read authorization header");
+        assert_eq!(header, "AUTHORIZE request-1 6\n");
+        let mut pin = [0_u8; 6];
+        reader.read_exact(&mut pin).expect("read terminal PIN");
+        assert_eq!(&pin, b"123456");
+        writeln!(reader.get_mut(), "OK authorized").expect("approve request");
+        fs::write(completion_for_server, b"authorized").expect("release wrapped command");
+    });
+
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+        .expect("open pseudoterminal");
+    grantpt(&master).expect("grant pseudoterminal");
+    unlockpt(&master).expect("unlock pseudoterminal");
+    let slave = ioctl_tiocgptpeer(&master, OpenptFlags::RDWR | OpenptFlags::CLOEXEC)
+        .expect("open pseudoterminal slave");
+    let slave = fs::File::from(slave);
+    let shell_command = format!(
+        "while test ! -e '{}'; do sleep 0.02; done; exit 23",
+        completion.display()
+    );
+    let mut wrapped = Command::new("setsid")
+        .args([
+            "--wait",
+            "--ctty",
+            env!("CARGO_BIN_EXE_keyvisor"),
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell_command,
+        ])
+        .env("KEYVISOR_CONTROL_SOCKET", &control)
+        .stdin(slave.try_clone().expect("clone terminal input"))
+        .stdout(slave.try_clone().expect("clone terminal output"))
+        .stderr(slave)
+        .spawn()
+        .expect("start exec wrapper in a headless terminal");
+    thread::sleep(Duration::from_millis(250));
+    let mut master = fs::File::from(master);
+    master.write_all(b"123456\n").expect("enter terminal PIN");
+
+    let status = wrapped.wait().expect("wait for exec wrapper");
+    assert_eq!(status.code(), Some(23));
+    server.join().expect("join fake control server");
+    fs::remove_dir_all(root).expect("remove exec test directory");
+}
+
 struct TestEnvironment {
     swtpm: Child,
     root: PathBuf,

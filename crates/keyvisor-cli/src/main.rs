@@ -7,9 +7,15 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
+    os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use base64::{
@@ -23,7 +29,7 @@ use keyvisor_agent::{
 };
 use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
 use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmSigner};
-use rustix::process::geteuid;
+use rustix::process::{Pid, Signal, geteuid, kill_process};
 use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -31,6 +37,7 @@ use zeroize::{Zeroize, Zeroizing};
 const MAX_PIN_BYTES: usize = 64;
 const MAX_CONTROL_LINE_BYTES: u64 = 16 * 1024;
 const MAX_PINENTRY_LINE_BYTES: u64 = 16 * 1024;
+const MAX_PENDING_AUTHORIZATIONS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SecretInput {
@@ -67,6 +74,7 @@ fn run() -> Result<(), String> {
         [group, rest @ ..] if group == "agent" => run_agent(rest),
         [command, rest @ ..] if command == "history" => run_history(rest),
         [command, rest @ ..] if command == "authorize" => run_authorize(rest),
+        [command, rest @ ..] if command == "exec" => run_exec(rest),
         _ => Err(String::from("unknown command; run `keyvisor --help`")),
     }
 }
@@ -84,7 +92,8 @@ Usage:\n  \
   keyvisor config set NAME VALUE\n  \
   keyvisor agent status\n  \
   keyvisor history [--format human|tsv]\n  \
-  keyvisor authorize [REQUEST_ID] [--terminal|--pinentry|--pin-stdin]"
+  keyvisor authorize [REQUEST_ID] [--terminal|--pinentry|--pin-stdin]\n  \
+  keyvisor exec -- COMMAND [ARGUMENT ...]"
     );
 }
 
@@ -369,6 +378,15 @@ fn run_authorize(arguments: &[OsString]) -> Result<(), String> {
         .into_iter()
         .find_map(|(request_id, key_name)| (request_id == id).then_some(key_name))
         .ok_or_else(|| String::from("authorization request is not pending"))?;
+    authorize_request(&id, &key_name, secret_input, true)
+}
+
+fn authorize_request(
+    id: &str,
+    key_name: &str,
+    secret_input: SecretInput,
+    report_success: bool,
+) -> Result<(), String> {
     let pin = read_existing_pin(
         &format!("SSH signature with key “{key_name}”"),
         secret_input,
@@ -379,11 +397,152 @@ fn run_authorize(arguments: &[OsString]) -> Result<(), String> {
     stream.flush().map_err(control_io)?;
     let line = read_control_line(&mut stream)?;
     if line == "OK authorized" {
-        println!("authorized {id}");
+        if report_success {
+            println!("authorized {id}");
+        }
         Ok(())
     } else {
         Err(control_error(&line))
     }
+}
+
+fn run_exec(arguments: &[OsString]) -> Result<(), String> {
+    let Some((separator, command)) = arguments.split_first() else {
+        return Err(String::from(
+            "usage: keyvisor exec -- COMMAND [ARGUMENT ...]",
+        ));
+    };
+    if separator != "--" || command.is_empty() {
+        return Err(String::from(
+            "usage: keyvisor exec -- COMMAND [ARGUMENT ...]",
+        ));
+    }
+    if !fetch_authorization_requests_if_running()?.is_empty() {
+        return Err(String::from(
+            "cannot start command while another authorization request is pending",
+        ));
+    }
+
+    let signals = ForwardedSignals::install()?;
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .spawn()
+        .map_err(|error| format!("cannot start `{}`: {error}", command[0].to_string_lossy()))?;
+    let result = supervise_exec_child(&mut child, &signals);
+    if result.is_err() {
+        terminate_child(&mut child);
+    }
+    let status = result?;
+    drop(signals);
+    std::process::exit(exit_status_code(status));
+}
+
+fn supervise_exec_child(
+    child: &mut std::process::Child,
+    signals: &ForwardedSignals,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        signals.forward(child.id());
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot wait for the command: {error}"))?
+        {
+            return Ok(status);
+        }
+
+        let requests = fetch_authorization_requests_if_running()?;
+        match requests.as_slice() {
+            [] => {}
+            [(id, key_name)] => {
+                // Starting with an empty queue and accepting only a single
+                // request avoids selecting among unrelated concurrent uses.
+                authorize_request(id, key_name, SecretInput::Terminal, false)?;
+            }
+            _ => {
+                return Err(String::from(
+                    "multiple authorization requests are pending; refusing to choose one",
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn fetch_authorization_requests_if_running() -> Result<Vec<(String, String)>, String> {
+    let path = control_socket_path()?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => fetch_authorization_requests(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("cannot inspect the agent control socket: {error}")),
+    }
+}
+
+struct ForwardedSignals {
+    registrations: Vec<signal_hook::SigId>,
+    pending: Vec<(Signal, Arc<AtomicBool>)>,
+}
+
+impl ForwardedSignals {
+    fn install() -> Result<Self, String> {
+        let mut installed = Self {
+            registrations: Vec::new(),
+            pending: Vec::new(),
+        };
+        for (raw, signal) in [
+            (signal_hook::consts::SIGHUP, Signal::HUP),
+            (signal_hook::consts::SIGINT, Signal::INT),
+            (signal_hook::consts::SIGQUIT, Signal::QUIT),
+            (signal_hook::consts::SIGTERM, Signal::TERM),
+        ] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let registration = signal_hook::flag::register(raw, Arc::clone(&flag))
+                .map_err(|error| format!("cannot install signal forwarding: {error}"))?;
+            installed.registrations.push(registration);
+            installed.pending.push((signal, flag));
+        }
+        Ok(installed)
+    }
+
+    fn forward(&self, child_id: u32) {
+        let Some(pid) = i32::try_from(child_id).ok().and_then(Pid::from_raw) else {
+            return;
+        };
+        for (signal, pending) in &self.pending {
+            if pending.swap(false, Ordering::Relaxed) {
+                let _ = kill_process(pid, *signal);
+            }
+        }
+    }
+}
+
+impl Drop for ForwardedSignals {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+        let _ = kill_process(pid, Signal::TERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
 }
 
 fn list_authorization_requests() -> Result<(), String> {
@@ -407,6 +566,11 @@ fn fetch_authorization_requests() -> Result<Vec<(String, String)>, String> {
         .ok_or_else(|| control_error(&header))?
         .parse::<usize>()
         .map_err(|_| String::from("agent returned an invalid request count"))?;
+    if count > MAX_PENDING_AUTHORIZATIONS {
+        return Err(String::from(
+            "agent returned too many authorization requests",
+        ));
+    }
     let mut requests = Vec::with_capacity(count);
     for _ in 0..count {
         let line = read_control_line(&mut stream)?;
@@ -816,7 +980,7 @@ fn decode_hex_text(value: &str) -> Result<String, String> {
         return Err(String::from("agent returned invalid key-name encoding"));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0 {
         let high = hex_digit(pair[0])?;
         let low = hex_digit(pair[1])?;
         bytes.push((high << 4) | low);
