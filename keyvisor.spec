@@ -1,5 +1,5 @@
 Name:           keyvisor
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Command-line TPM-backed SSH agent and key manager
 
@@ -82,6 +82,9 @@ cargo test --locked --offline --workspace --all-features
 %{_userunitdir}/me.nexryai.keyvisor-agent.socket
 
 %changelog
+* Wed Oct 07 2026 nexryai <noreply@nexryai.me> - 0.1.2-1
+- Add TPM-backed ECDSA NIST P-384 keys and algorithm selection
+
 * Wed Aug 12 2026 nexryai <noreply@nexryai.me> - 0.1.1-1
 - Default to the kernel TPM resource manager
 

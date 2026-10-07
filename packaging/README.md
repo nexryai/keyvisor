@@ -30,14 +30,14 @@ Run from the repository root:
 
 ```sh
 ./build-aux/srpm.sh dist
-rpm -qpi dist/keyvisor-0.1.0-1*.src.rpm
+rpm -qpi dist/keyvisor-0.1.2-1*.src.rpm
 ```
 
 Build it in a clean Fedora 44 chroot before uploading:
 
 ```sh
 mock -r fedora-44-x86_64 \
-  --rebuild dist/keyvisor-0.1.0-1*.src.rpm
+  --rebuild dist/keyvisor-0.1.2-1*.src.rpm
 ```
 
 The RPM test suite uses `swtpm`; it does not access the builder's physical TPM.
@@ -51,7 +51,7 @@ Download the API token from the COPR account page and save it as
 copr-cli create keyvisor \
   --chroot fedora-44-x86_64 \
   --chroot fedora-rawhide-x86_64
-copr-cli build OWNER/keyvisor dist/keyvisor-0.1.0-1*.src.rpm
+copr-cli build OWNER/keyvisor dist/keyvisor-0.1.2-1*.src.rpm
 ```
 
 For a project owned by the logged-in user, `keyvisor` can be used instead of
