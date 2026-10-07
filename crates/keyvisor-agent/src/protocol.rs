@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use keyvisor_core::KeySummary;
+use keyvisor_core::{KeyAlgorithm, KeySummary};
 
 pub const MAX_PACKET_LENGTH: usize = 256 * 1024;
 
@@ -11,7 +11,6 @@ const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
-const ECDSA_SHA2_NISTP256: &[u8] = b"ecdsa-sha2-nistp256";
 
 /// Supported, fully validated agent requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,24 +111,27 @@ pub fn identities_response(keys: &[KeySummary]) -> Result<Vec<u8>, ProtocolError
     checked_frame(&payload)
 }
 
-/// Encodes a raw 64-byte TPM ECDSA P-256 signature for OpenSSH.
+/// Encodes fixed-width TPM ECDSA scalar components for OpenSSH.
 ///
 /// # Errors
 ///
 /// Returns [`ProtocolError::InvalidSignature`] unless `signature` contains
-/// exactly 32-byte `r` and `s` components.
-pub fn ecdsa_signature_response(signature: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+/// exactly two components of the selected algorithm’s width.
+pub fn ecdsa_signature_response(
+    algorithm: KeyAlgorithm,
+    signature: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
     let (r, s) = signature
-        .split_at_checked(32)
-        .filter(|(_, s)| s.len() == 32)
+        .split_at_checked(algorithm.ecdsa_component_size())
+        .filter(|(_, s)| s.len() == algorithm.ecdsa_component_size())
         .ok_or(ProtocolError::InvalidSignature)?;
 
-    let mut ecdsa = Vec::with_capacity(74);
+    let mut ecdsa = Vec::new();
     push_mpint(&mut ecdsa, r)?;
     push_mpint(&mut ecdsa, s)?;
 
-    let mut signature_blob = Vec::with_capacity(104);
-    push_string(&mut signature_blob, ECDSA_SHA2_NISTP256)?;
+    let mut signature_blob = Vec::new();
+    push_string(&mut signature_blob, algorithm.ssh_key_type().as_bytes())?;
     push_string(&mut signature_blob, &ecdsa)?;
 
     let mut payload = Vec::with_capacity(signature_blob.len() + 5);
@@ -304,47 +306,51 @@ mod tests {
 
     #[test]
     fn encodes_canonical_positive_ecdsa_mpints() {
-        let mut raw = [0_u8; 64];
-        raw[0] = 0x80;
-        raw[63] = 1;
-        let signature = ecdsa_signature_response(&raw).expect("encode signature");
+        for algorithm in [KeyAlgorithm::EcdsaNistP256, KeyAlgorithm::EcdsaNistP384] {
+            let width = algorithm.ecdsa_component_size();
+            let mut raw = vec![0_u8; width * 2];
+            raw[0] = 0x80;
+            raw[width * 2 - 1] = 1;
+            let signature = ecdsa_signature_response(algorithm, &raw).expect("encode signature");
 
-        let mut packet = signature.as_slice();
-        let framed_payload = take_test_string(&mut packet);
-        assert!(packet.is_empty(), "the outer frame has no trailing bytes");
-        assert_eq!(framed_payload[0], 14);
+            let mut packet = signature.as_slice();
+            let framed_payload = take_test_string(&mut packet);
+            assert!(packet.is_empty(), "the outer frame has no trailing bytes");
+            assert_eq!(framed_payload[0], 14);
 
-        let mut response = &framed_payload[1..];
-        let mut signature_blob = take_test_string(&mut response);
-        assert!(
-            response.is_empty(),
-            "the sign response contains one signature blob"
-        );
-        assert_eq!(
-            take_test_string(&mut signature_blob),
-            b"ecdsa-sha2-nistp256"
-        );
-        let mut scalars = take_test_string(&mut signature_blob);
-        assert!(signature_blob.is_empty());
+            let mut response = &framed_payload[1..];
+            let mut signature_blob = take_test_string(&mut response);
+            assert!(
+                response.is_empty(),
+                "the sign response contains one signature blob"
+            );
+            assert_eq!(
+                take_test_string(&mut signature_blob),
+                algorithm.ssh_key_type().as_bytes()
+            );
+            let mut scalars = take_test_string(&mut signature_blob);
+            assert!(signature_blob.is_empty());
 
-        let r = take_test_string(&mut scalars);
-        let s = take_test_string(&mut scalars);
-        assert!(scalars.is_empty());
+            let r = take_test_string(&mut scalars);
+            let s = take_test_string(&mut scalars);
+            assert!(scalars.is_empty());
 
-        // An unsigned TPM scalar with its high bit set needs a zero prefix so
-        // SSH's signed mpint representation remains positive.
-        assert_eq!(r.len(), 33);
-        assert_eq!(r[0], 0);
-        assert_eq!(r[1], 0x80);
+            // An unsigned TPM scalar with its high bit set needs a zero prefix so
+            // SSH's signed mpint representation remains positive.
+            assert_eq!(r.len(), width + 1);
+            assert_eq!(r[0], 0);
+            assert_eq!(r[1], 0x80);
 
-        // Leading zeroes are stripped from positive scalars to keep the mpint
-        // canonical and acceptable to strict OpenSSH decoders.
-        assert_eq!(s, &[1]);
+            // Leading zeroes are stripped from positive scalars to keep the mpint
+            // canonical and acceptable to strict OpenSSH decoders.
+            assert_eq!(s, &[1]);
+        }
     }
 
     #[test]
     fn encodes_zero_scalars_and_rejects_wrong_signature_lengths() {
-        let signature = ecdsa_signature_response(&[0; 64]).expect("encode zero scalars");
+        let signature = ecdsa_signature_response(KeyAlgorithm::EcdsaNistP256, &[0; 64])
+            .expect("encode zero scalars");
         let mut packet = signature.as_slice();
         let framed_payload = take_test_string(&mut packet);
         let mut response = &framed_payload[1..];
@@ -360,11 +366,11 @@ mod tests {
         // The TPM backend contract is a fixed r||s encoding. Accepting any
         // other size could silently split the two components at the wrong byte.
         assert_eq!(
-            ecdsa_signature_response(&[0; 63]),
+            ecdsa_signature_response(KeyAlgorithm::EcdsaNistP256, &[0; 63]),
             Err(ProtocolError::InvalidSignature)
         );
         assert_eq!(
-            ecdsa_signature_response(&[0; 65]),
+            ecdsa_signature_response(KeyAlgorithm::EcdsaNistP256, &[0; 65]),
             Err(ProtocolError::InvalidSignature)
         );
     }

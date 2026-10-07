@@ -254,6 +254,7 @@ fn decode(bytes: &[u8]) -> Result<StoredKey, StoreError> {
     let name = read_text(&mut input)?;
     let algorithm = match take_byte(&mut input)? {
         1 => KeyAlgorithm::EcdsaNistP256,
+        2 => KeyAlgorithm::EcdsaNistP384,
         _ => return Err(StoreError::InvalidRecord),
     };
     let use_policy = read_policy(take_byte(&mut input)?)?;
@@ -327,6 +328,7 @@ fn take_byte(input: &mut &[u8]) -> Result<u8, StoreError> {
 const fn algorithm_tag(algorithm: KeyAlgorithm) -> u8 {
     match algorithm {
         KeyAlgorithm::EcdsaNistP256 => 1,
+        KeyAlgorithm::EcdsaNistP384 => 2,
     }
 }
 
@@ -463,6 +465,20 @@ mod tests {
         assert!(!entries[0].file_name().to_string_lossy().contains('/'));
 
         fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[test]
+    fn preserves_algorithm_tags_and_round_trips_both_curves() {
+        for (algorithm, tag) in [
+            (KeyAlgorithm::EcdsaNistP256, 1),
+            (KeyAlgorithm::EcdsaNistP384, 2),
+        ] {
+            let mut key = fixture("algorithm");
+            key.summary.algorithm = algorithm;
+            assert_eq!(super::algorithm_tag(algorithm), tag);
+            let encoded = super::encode(&key).expect("encode key");
+            assert_eq!(super::decode(&encoded).expect("decode key"), key);
+        }
     }
 
     #[test]

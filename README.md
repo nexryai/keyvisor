@@ -84,13 +84,18 @@ Create a no-PIN key for unattended signing:
 keyvisor key create --name "Automation" --authorization none
 ```
 
+Use `--algorithm ecdsa-p256` or `--algorithm ecdsa-p384` to select the curve.
+P-256 remains the default. P-384 uses SHA-384 and requires TPM support; an
+unsupported curve fails without a software fallback. Existing P-256 records
+remain compatible, and `key show` reports the selected SSH key type.
+
 Keyvisor displays the same-user socket risk and asks for confirmation. For
 explicit automation, add `--yes`.
 
 Create a TPM-PIN key:
 
 ```sh
-keyvisor key create --name "Work" --authorization pin
+keyvisor key create --name "Work" --algorithm ecdsa-p384 --authorization pin
 ```
 
 The PIN and confirmation are read from `/dev/tty` with terminal echo disabled.

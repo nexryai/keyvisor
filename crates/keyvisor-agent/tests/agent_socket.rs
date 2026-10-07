@@ -90,6 +90,16 @@ impl TestEnvironment {
     }
 
     fn generate(&self, name: &str, authorization: &str, pin: &[u8]) {
+        self.generate_algorithm(name, authorization, pin, KeyAlgorithm::EcdsaNistP256);
+    }
+
+    fn generate_algorithm(
+        &self,
+        name: &str,
+        authorization: &str,
+        pin: &[u8],
+        algorithm: KeyAlgorithm,
+    ) {
         let authorization = match authorization {
             "none" => TpmAuthorization::None,
             "pin" => TpmAuthorization::Pin(pin),
@@ -97,7 +107,7 @@ impl TestEnvironment {
         };
         let mut tpm = EsapiTpm::connect(&self.tcti).expect("connect generation TPM");
         let (summary, object) = tpm
-            .generate(name, KeyAlgorithm::EcdsaNistP256, authorization)
+            .generate(name, algorithm, authorization)
             .expect("generate test key");
         KeyStore::new(store_directory(&self.data_home()))
             .save(&keyvisor_agent::StoredKey { summary, object })
@@ -346,8 +356,17 @@ fn serves_identities_and_signs_with_both_authorization_modes() {
 
 #[test]
 fn signs_and_verifies_with_openssh_clients() {
+    openssh_interoperability(KeyAlgorithm::EcdsaNistP256);
+}
+
+#[test]
+fn signs_and_verifies_p384_with_openssh_clients() {
+    openssh_interoperability(KeyAlgorithm::EcdsaNistP384);
+}
+
+fn openssh_interoperability(algorithm: KeyAlgorithm) {
     let mut environment = TestEnvironment::start();
-    environment.generate("OpenSSH interoperability", "none", b"");
+    environment.generate_algorithm("OpenSSH interoperability", "none", b"", algorithm);
     drop(environment.start_agent());
 
     let identities = environment
@@ -367,7 +386,7 @@ fn signs_and_verifies_with_openssh_clients() {
     // the ECDSA public-key blob emitted by Keyvisor.
     assert_eq!(public_key_lines.len(), 1);
     assert!(
-        public_key_lines[0].starts_with("ecdsa-sha2-nistp256 "),
+        public_key_lines[0].starts_with(&format!("{} ", algorithm.ssh_key_type())),
         "unexpected OpenSSH identity: {}",
         public_key_lines[0]
     );

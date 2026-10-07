@@ -15,7 +15,7 @@ use std::{
 };
 
 use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
-use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmError, TpmSigner};
+use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmError, TpmObject, TpmSigner};
 
 struct Swtpm {
     child: Child,
@@ -107,6 +107,15 @@ fn unused_port_pair() -> (u16, u16) {
 
 #[test]
 fn generates_reloads_and_signs_with_both_authorization_modes() {
+    generation_and_authorization(KeyAlgorithm::EcdsaNistP256);
+}
+
+#[test]
+fn generates_reloads_and_signs_p384_with_both_authorization_modes() {
+    generation_and_authorization(KeyAlgorithm::EcdsaNistP384);
+}
+
+fn generation_and_authorization(algorithm: KeyAlgorithm) {
     let swtpm = Swtpm::start();
     let mut tpm = swtpm.connect();
 
@@ -119,44 +128,43 @@ fn generates_reloads_and_signs_with_both_authorization_modes() {
     assert!(da_before.max_tries > 0);
 
     let (no_pin_summary, no_pin_object) = tpm
-        .generate(
-            "No PIN",
-            KeyAlgorithm::EcdsaNistP256,
-            TpmAuthorization::None,
-        )
+        .generate("No PIN", algorithm, TpmAuthorization::None)
         .expect("failed to generate no-PIN key");
     assert_eq!(no_pin_summary.use_policy, KeyUsePolicy::NoPin);
+    rejects_algorithm_mismatches(&mut tpm, &no_pin_object, algorithm);
 
-    // The returned SSH blob must identify the only algorithm currently
-    // supported by both the TPM template and the agent protocol.
-    let algorithm = b"ecdsa-sha2-nistp256";
-    assert_eq!(
-        &no_pin_summary.public_key[4..4 + algorithm.len()],
-        algorithm
-    );
+    // The returned SSH blob must identify the selected key type.
+    let key_type = algorithm.ssh_key_type().as_bytes();
+    assert_eq!(&no_pin_summary.public_key[4..4 + key_type.len()], key_type);
 
-    // A 64-byte result proves that TPM2_Sign returned fixed-width P-256 r and
+    // The result proves that TPM2_Sign returned fixed-width ECDSA r and
     // s components through the backend contract.
     assert_eq!(
-        tpm.sign(&no_pin_object, &[0x42; 32], TpmAuthorization::None)
-            .expect("failed to sign with no-PIN key")
-            .len(),
-        64
+        tpm.sign(
+            &no_pin_object,
+            algorithm,
+            &vec![0x42; algorithm.digest_size()],
+            TpmAuthorization::None
+        )
+        .expect("failed to sign with no-PIN key")
+        .len(),
+        2 * algorithm.ecdsa_component_size()
     );
 
     let (pin_summary, pin_object) = tpm
-        .generate(
-            "PIN",
-            KeyAlgorithm::EcdsaNistP256,
-            TpmAuthorization::Pin(b"123456"),
-        )
+        .generate("PIN", algorithm, TpmAuthorization::Pin(b"123456"))
         .expect("failed to generate PIN key");
     assert_eq!(pin_summary.use_policy, KeyUsePolicy::TpmPin);
 
     // The incorrect PIN must be rejected by the TPM authorization command,
     // not retried as a no-PIN request or handled by a software signer.
     assert_eq!(
-        tpm.sign(&pin_object, &[0x24; 32], TpmAuthorization::Pin(b"wrong")),
+        tpm.sign(
+            &pin_object,
+            algorithm,
+            &vec![0x24; algorithm.digest_size()],
+            TpmAuthorization::Pin(b"wrong")
+        ),
         Err(TpmError::AuthorizationFailed)
     );
     // Read the failure counter before a successful authorization, because TPM
@@ -182,10 +190,15 @@ fn generates_reloads_and_signs_with_both_authorization_modes() {
     );
 
     assert_eq!(
-        tpm.sign(&pin_object, &[0x24; 32], TpmAuthorization::Pin(b"123456"))
-            .expect("failed to sign with PIN key")
-            .len(),
-        64
+        tpm.sign(
+            &pin_object,
+            algorithm,
+            &vec![0x24; algorithm.digest_size()],
+            TpmAuthorization::Pin(b"123456")
+        )
+        .expect("failed to sign with PIN key")
+        .len(),
+        2 * algorithm.ecdsa_component_size()
     );
 
     drop(tpm);
@@ -196,11 +209,39 @@ fn generates_reloads_and_signs_with_both_authorization_modes() {
     // transient handle or in-memory private material.
     assert_eq!(
         reconnected
-            .sign(&no_pin_object, &[0x11; 32], TpmAuthorization::None)
+            .sign(
+                &no_pin_object,
+                algorithm,
+                &vec![0x11; algorithm.digest_size()],
+                TpmAuthorization::None
+            )
             .expect("failed to sign after recreating the storage parent")
             .len(),
-        64
+        2 * algorithm.ecdsa_component_size()
     );
+}
+
+fn rejects_algorithm_mismatches(tpm: &mut EsapiTpm, object: &TpmObject, algorithm: KeyAlgorithm) {
+    let other = match algorithm {
+        KeyAlgorithm::EcdsaNistP256 => KeyAlgorithm::EcdsaNistP384,
+        KeyAlgorithm::EcdsaNistP384 => KeyAlgorithm::EcdsaNistP256,
+    };
+    // Metadata must not reinterpret a wrapped object as another algorithm.
+    assert_eq!(
+        tpm.sign(
+            object,
+            other,
+            &vec![0; other.digest_size()],
+            TpmAuthorization::None
+        ),
+        Err(TpmError::InvalidObject)
+    );
+    for length in [algorithm.digest_size() - 1, algorithm.digest_size() + 1] {
+        assert_eq!(
+            tpm.sign(object, algorithm, &vec![0; length], TpmAuthorization::None),
+            Err(TpmError::InvalidObject)
+        );
+    }
 }
 
 #[test]
@@ -239,24 +280,40 @@ fn rejects_policy_downgrades_and_tampered_objects() {
     assert_eq!(
         tpm.sign(
             &no_pin_object,
+            KeyAlgorithm::EcdsaNistP256,
             &[0x11; 32],
             TpmAuthorization::Pin(b"123456"),
         ),
         Err(TpmError::InvalidAuthorization)
     );
     assert_eq!(
-        tpm.sign(&pin_object, &[0x11; 32], TpmAuthorization::None),
+        tpm.sign(
+            &pin_object,
+            KeyAlgorithm::EcdsaNistP256,
+            &[0x11; 32],
+            TpmAuthorization::None
+        ),
         Err(TpmError::InvalidAuthorization)
     );
 
     // P-256/SHA-256 signing accepts exactly one 32-byte digest. Rejecting other
     // sizes prevents implicit hashing or truncation inside the TPM boundary.
     assert_eq!(
-        tpm.sign(&no_pin_object, &[0x11; 31], TpmAuthorization::None),
+        tpm.sign(
+            &no_pin_object,
+            KeyAlgorithm::EcdsaNistP256,
+            &[0x11; 31],
+            TpmAuthorization::None
+        ),
         Err(TpmError::InvalidObject)
     );
     assert_eq!(
-        tpm.sign(&no_pin_object, &[0x11; 33], TpmAuthorization::None),
+        tpm.sign(
+            &no_pin_object,
+            KeyAlgorithm::EcdsaNistP256,
+            &[0x11; 33],
+            TpmAuthorization::None
+        ),
         Err(TpmError::InvalidObject)
     );
 
@@ -267,7 +324,12 @@ fn rejects_policy_downgrades_and_tampered_objects() {
     // mismatch before TPM2_Load gives corrupted or copied records a stable,
     // fail-closed result.
     assert_eq!(
-        tpm.sign(&foreign_parent, &[0x11; 32], TpmAuthorization::None),
+        tpm.sign(
+            &foreign_parent,
+            KeyAlgorithm::EcdsaNistP256,
+            &[0x11; 32],
+            TpmAuthorization::None
+        ),
         Err(TpmError::InvalidObject)
     );
 
@@ -278,7 +340,12 @@ fn rejects_policy_downgrades_and_tampered_objects() {
     // unmarshalling instead of pairing attacker-chosen metadata with the
     // TPM-wrapped private blob.
     assert_eq!(
-        tpm.sign(&corrupted_public, &[0x11; 32], TpmAuthorization::None),
+        tpm.sign(
+            &corrupted_public,
+            KeyAlgorithm::EcdsaNistP256,
+            &[0x11; 32],
+            TpmAuthorization::None
+        ),
         Err(TpmError::InvalidObject)
     );
 }

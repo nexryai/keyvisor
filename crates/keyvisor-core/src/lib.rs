@@ -26,6 +26,46 @@ impl KeyId {
 pub enum KeyAlgorithm {
     /// ECDSA over the TPM-supported NIST P-256 curve.
     EcdsaNistP256,
+    /// ECDSA over the TPM-supported NIST P-384 curve.
+    EcdsaNistP384,
+}
+
+impl KeyAlgorithm {
+    /// Returns the OpenSSH key type.
+    #[must_use]
+    pub const fn ssh_key_type(self) -> &'static str {
+        match self {
+            Self::EcdsaNistP256 => "ecdsa-sha2-nistp256",
+            Self::EcdsaNistP384 => "ecdsa-sha2-nistp384",
+        }
+    }
+
+    /// Returns the SSH curve identifier.
+    #[must_use]
+    pub const fn ssh_curve_name(self) -> &'static str {
+        match self {
+            Self::EcdsaNistP256 => "nistp256",
+            Self::EcdsaNistP384 => "nistp384",
+        }
+    }
+
+    /// Returns the required signing digest length in bytes.
+    #[must_use]
+    pub const fn digest_size(self) -> usize {
+        match self {
+            Self::EcdsaNistP256 => 32,
+            Self::EcdsaNistP384 => 48,
+        }
+    }
+
+    /// Returns the fixed width of an ECDSA scalar or public coordinate.
+    #[must_use]
+    pub const fn ecdsa_component_size(self) -> usize {
+        match self {
+            Self::EcdsaNistP256 => 32,
+            Self::EcdsaNistP384 => 48,
+        }
+    }
 }
 
 /// Authorization mode selected when a TPM signing object is created.

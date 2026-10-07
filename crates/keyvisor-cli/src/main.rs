@@ -83,7 +83,7 @@ fn print_help() {
     println!(
         "Keyvisor — TPM-backed SSH key management\n\n\
 Usage:\n  \
-  keyvisor key create --name NAME --authorization none|pin [--yes] [--terminal|--pinentry|--pin-stdin]\n  \
+  keyvisor key create --name NAME --authorization none|pin [--algorithm ecdsa-p256|ecdsa-p384] [--yes] [--terminal|--pinentry|--pin-stdin]\n  \
   keyvisor key list [--format human|tsv]\n  \
   keyvisor key show ID\n  \
   keyvisor key delete ID [--yes]\n  \
@@ -110,6 +110,7 @@ fn run_key(arguments: &[OsString]) -> Result<(), String> {
 fn create_key(arguments: &[OsString]) -> Result<(), String> {
     let mut name = None;
     let mut policy = None;
+    let mut algorithm = KeyAlgorithm::EcdsaNistP256;
     let mut confirmed = false;
     let mut secret_input = SecretInput::Auto;
     let mut index = 0;
@@ -121,6 +122,18 @@ fn create_key(arguments: &[OsString]) -> Result<(), String> {
                         .trim()
                         .to_owned(),
                 );
+                index += 2;
+            }
+            Some("--algorithm") if index + 1 < arguments.len() => {
+                algorithm = match arguments[index + 1].to_str() {
+                    Some("ecdsa-p256") => KeyAlgorithm::EcdsaNistP256,
+                    Some("ecdsa-p384") => KeyAlgorithm::EcdsaNistP384,
+                    _ => {
+                        return Err(String::from(
+                            "algorithm must be `ecdsa-p256` or `ecdsa-p384`",
+                        ));
+                    }
+                };
                 index += 2;
             }
             Some("--authorization") if index + 1 < arguments.len() => {
@@ -179,7 +192,7 @@ fn create_key(arguments: &[OsString]) -> Result<(), String> {
     let mut tpm =
         EsapiTpm::connect_default().map_err(|error| format!("cannot open the TPM: {error}"))?;
     let (summary, object) = tpm
-        .generate(&name, KeyAlgorithm::EcdsaNistP256, authorization)
+        .generate(&name, algorithm, authorization)
         .map_err(|error| format!("cannot generate the TPM key: {error}"))?;
     let id = summary.id.as_str().to_owned();
     KeyStore::new(store_directory()?)
@@ -227,11 +240,12 @@ fn show_key(id: &OsString) -> Result<(), String> {
     let key = find_key(id)?;
     println!("ID: {}", key.summary.id.as_str());
     println!("Name: {}", key.summary.name);
-    println!("Algorithm: ecdsa-sha2-nistp256");
+    println!("Algorithm: {}", key.summary.algorithm.ssh_key_type());
     println!("Authorization: {}", policy_name(key.summary.use_policy));
     println!("Fingerprint: {}", fingerprint(&key.summary.public_key));
     println!(
-        "Public key: ecdsa-sha2-nistp256 {} {}",
+        "Public key: {} {} {}",
+        key.summary.algorithm.ssh_key_type(),
         STANDARD.encode(&key.summary.public_key),
         key.summary.name
     );

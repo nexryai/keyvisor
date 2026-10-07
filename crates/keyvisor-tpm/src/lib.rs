@@ -73,7 +73,7 @@ impl fmt::Display for TpmError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Unavailable => "TPM is unavailable",
-            Self::UnsupportedAlgorithm => "TPM algorithm is unsupported",
+            Self::UnsupportedAlgorithm => "this TPM does not support the requested key algorithm",
             Self::InvalidAuthorization => "TPM authorization is invalid",
             Self::AuthorizationFailed => "TPM authorization failed",
             Self::DictionaryAttackLockout => "TPM dictionary-attack lockout is active",
@@ -103,6 +103,7 @@ pub trait TpmSigner {
     ) -> Result<(KeySummary, TpmObject), TpmError>;
 
     /// Signs a bounded digest using `TPM2_Sign`.
+    /// The recorded algorithm must match the TPM public object before loading.
     ///
     /// # Errors
     ///
@@ -111,6 +112,7 @@ pub trait TpmSigner {
     fn sign(
         &mut self,
         key: &TpmObject,
+        algorithm: KeyAlgorithm,
         digest: &[u8],
         authorization: TpmAuthorization<'_>,
     ) -> Result<Vec<u8>, TpmError>;

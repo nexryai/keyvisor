@@ -20,7 +20,7 @@ agent for system-integrated secret entry without restoring a Keyvisor GUI.
 ## 2. Security boundary
 
 The private key is generated inside the TPM as a non-migratable signing object.
-For the first supported algorithm, Keyvisor creates an ECDSA NIST P-256 child
+Keyvisor creates an ECDSA NIST P-256 or NIST P-384 child
 beneath a Keyvisor storage parent with:
 
 - `fixedTPM`;
@@ -143,11 +143,12 @@ The following rules define the implemented CLI contract:
 
 ## 5. SSH protocol scope
 
-The first release supports:
+The implemented SSH protocol supports:
 
 - `SSH2_AGENTC_REQUEST_IDENTITIES`;
 - `SSH2_AGENTC_SIGN_REQUEST`;
 - ECDSA P-256 keys exposed as `ecdsa-sha2-nistp256`;
+- ECDSA P-384 keys exposed as `ecdsa-sha2-nistp384`;
 - strict packet length limits and request timeouts.
 
 Add/remove identity, smart-card, lock/unlock, and unknown extension requests
@@ -227,3 +228,13 @@ packages require no graphical toolkit. Keyvisor is TPM-backed only when keys
 are TPM-generated and fixed to this TPM and parent, every SSH signature is
 produced by `TPM2_Sign`, unsupported requests fail closed, and no normal or
 error path exposes plaintext private parameters.
+
+### P-384 algorithm selection (Issue #2)
+
+- [x] expose `--algorithm ecdsa-p256|ecdsa-p384`, retaining P-256 by default;
+- [x] preserve P-256 record tag 1 and assign P-384 tag 2 without migration;
+- [x] validate the recorded curve and ECDSA hash before loading TPM objects;
+- [x] use SHA-384 and 48-byte coordinates/scalars for P-384;
+- [x] reject unsupported TPM curves and preserve TPM generation, authorization,
+  encrypted sessions, and DA behavior for both algorithms;
+- [x] cover both algorithms with simulator and OpenSSH signature verification.

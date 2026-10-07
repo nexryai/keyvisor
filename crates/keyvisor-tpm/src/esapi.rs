@@ -6,7 +6,7 @@ use tss_esapi::{
     abstraction::cipher::Cipher,
     attributes::{ObjectAttributesBuilder, SessionAttributesBuilder},
     constants::{
-        PropertyTag, SessionType, Tss2ResponseCodeKind,
+        CapabilityType, PropertyTag, SessionType, Tss2ResponseCodeKind,
         tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK},
     },
     handles::{KeyHandle, ObjectHandle, SessionHandle},
@@ -17,8 +17,8 @@ use tss_esapi::{
         resource_handles::Hierarchy,
     },
     structures::{
-        Auth, Digest, EccPoint, EccScheme, HashScheme, HashcheckTicket, Private, Public,
-        PublicBuilder, PublicEccParametersBuilder, RsaExponent, Signature, SignatureScheme,
+        Auth, CapabilityData, Digest, EccPoint, EccScheme, HashScheme, HashcheckTicket, Private,
+        Public, PublicBuilder, PublicEccParametersBuilder, RsaExponent, Signature, SignatureScheme,
         SymmetricDefinition,
     },
     tcti_ldr::TctiNameConf,
@@ -98,7 +98,10 @@ impl EsapiTpm {
         Self::connect(&tcti)
     }
 
-    fn create_public(use_policy: KeyUsePolicy) -> Result<Public, TpmError> {
+    fn create_public(
+        algorithm: KeyAlgorithm,
+        use_policy: KeyUsePolicy,
+    ) -> Result<Public, TpmError> {
         // These attributes are the extraction boundary: the TPM creates the
         // sensitive value and binds it to this TPM and this parent. `noDA` is
         // deliberately policy-dependent so only PIN keys consume DA attempts.
@@ -115,12 +118,12 @@ impl EsapiTpm {
             .map_err(map_tss_error)?;
         let scheme = EccScheme::create(
             EccSchemeAlgorithm::EcDsa,
-            Some(HashingAlgorithm::Sha256),
+            Some(hash_algorithm(algorithm)),
             None,
         )
         .map_err(map_tss_error)?;
         let parameters =
-            PublicEccParametersBuilder::new_unrestricted_signing_key(scheme, EccCurve::NistP256)
+            PublicEccParametersBuilder::new_unrestricted_signing_key(scheme, ecc_curve(algorithm))
                 .build()
                 .map_err(map_tss_error)?;
 
@@ -134,7 +137,11 @@ impl EsapiTpm {
             .map_err(map_tss_error)
     }
 
-    fn validate_public(public: &Public, use_policy: KeyUsePolicy) -> Result<(), TpmError> {
+    fn validate_public(
+        public: &Public,
+        algorithm: KeyAlgorithm,
+        use_policy: KeyUsePolicy,
+    ) -> Result<(), TpmError> {
         // Persisted TPM2B_PUBLIC bytes are host-controlled input. Re-check the
         // complete security-relevant template before loading the paired blob.
         let attributes = public.object_attributes();
@@ -152,11 +159,11 @@ impl EsapiTpm {
 
         match public {
             Public::Ecc { parameters, .. }
-                if parameters.ecc_curve() == EccCurve::NistP256
+                if parameters.ecc_curve() == ecc_curve(algorithm)
                     && parameters.ecc_scheme()
                         == EccScheme::create(
                             EccSchemeAlgorithm::EcDsa,
-                            Some(HashingAlgorithm::Sha256),
+                            Some(hash_algorithm(algorithm)),
                             None,
                         )
                         .map_err(map_tss_error)? =>
@@ -167,14 +174,14 @@ impl EsapiTpm {
         }
     }
 
-    fn load(&mut self, object: &TpmObject) -> Result<KeyHandle, TpmError> {
+    fn load(&mut self, object: &TpmObject, algorithm: KeyAlgorithm) -> Result<KeyHandle, TpmError> {
         // Reject blobs created under another parent before asking the TPM to
         // process them; this also gives corrupted records a stable error path.
         if object.parent_name != self.parent_name {
             return Err(TpmError::InvalidObject);
         }
         let public = Public::unmarshall(&object.public).map_err(|_| TpmError::InvalidObject)?;
-        Self::validate_public(&public, object.use_policy)?;
+        Self::validate_public(&public, algorithm, object.use_policy)?;
         let private = Private::try_from(object.wrapped_private.clone())
             .map_err(|_| TpmError::InvalidObject)?;
         with_encrypted_session(&mut self.context, self.parent, None, |context| {
@@ -191,11 +198,23 @@ impl TpmSigner for EsapiTpm {
         algorithm: KeyAlgorithm,
         authorization: TpmAuthorization<'_>,
     ) -> Result<(KeySummary, TpmObject), TpmError> {
-        if algorithm != KeyAlgorithm::EcdsaNistP256 {
-            return Err(TpmError::UnsupportedAlgorithm);
+        // Request the selected curve directly so capability-list pagination
+        // cannot incorrectly report a supported curve as unavailable.
+        let (capabilities, _) = self
+            .context
+            .get_capability(
+                CapabilityType::EccCurves,
+                u32::from(u16::from(ecc_curve(algorithm))),
+                1,
+            )
+            .map_err(map_tss_error)?;
+        match capabilities {
+            CapabilityData::EccCurves(curves) if curves.contains(&ecc_curve(algorithm).into()) => {}
+            CapabilityData::EccCurves(_) => return Err(TpmError::UnsupportedAlgorithm),
+            _ => return Err(TpmError::Transport),
         }
         let (auth, use_policy) = authorization_value(authorization)?;
-        let requested_public = Self::create_public(use_policy)?;
+        let requested_public = Self::create_public(algorithm, use_policy)?;
         // TPM2_Create generates the private scalar internally. `out_private`
         // is a TPM-wrapped blob and never contains an exportable private key.
         let result = with_encrypted_session(&mut self.context, self.parent, None, |context| {
@@ -203,8 +222,8 @@ impl TpmSigner for EsapiTpm {
         })
         .map_err(map_tss_error)?;
 
-        Self::validate_public(&result.out_public, use_policy)?;
-        let ssh_public_key = ssh_public_key(&result.out_public)?;
+        Self::validate_public(&result.out_public, algorithm, use_policy)?;
+        let ssh_public_key = ssh_public_key(&result.out_public, algorithm)?;
         let child = with_encrypted_session(&mut self.context, self.parent, None, |context| {
             context.load(
                 self.parent,
@@ -243,10 +262,11 @@ impl TpmSigner for EsapiTpm {
     fn sign(
         &mut self,
         key: &TpmObject,
+        algorithm: KeyAlgorithm,
         digest: &[u8],
         authorization: TpmAuthorization<'_>,
     ) -> Result<Vec<u8>, TpmError> {
-        if digest.len() != 32 {
+        if digest.len() != algorithm.digest_size() {
             return Err(TpmError::InvalidObject);
         }
         let (auth, use_policy) = authorization_value(authorization)?;
@@ -254,7 +274,7 @@ impl TpmSigner for EsapiTpm {
             return Err(TpmError::InvalidAuthorization);
         }
 
-        let child = self.load(key)?;
+        let child = self.load(key, algorithm)?;
         self.context
             .tr_set_auth(child.into(), auth)
             .map_err(map_tss_error)?;
@@ -274,7 +294,7 @@ impl TpmSigner for EsapiTpm {
                     child,
                     digest,
                     SignatureScheme::EcDsa {
-                        hash_scheme: HashScheme::new(HashingAlgorithm::Sha256),
+                        hash_scheme: HashScheme::new(hash_algorithm(algorithm)),
                     },
                     validation,
                 )
@@ -295,9 +315,17 @@ impl TpmSigner for EsapiTpm {
 
         match signature {
             Signature::EcDsa(signature) => {
-                let mut raw = Vec::with_capacity(64);
-                append_padded_32(&mut raw, signature.signature_r().value())?;
-                append_padded_32(&mut raw, signature.signature_s().value())?;
+                let mut raw = Vec::with_capacity(2 * algorithm.ecdsa_component_size());
+                append_padded(
+                    &mut raw,
+                    signature.signature_r().value(),
+                    algorithm.ecdsa_component_size(),
+                )?;
+                append_padded(
+                    &mut raw,
+                    signature.signature_s().value(),
+                    algorithm.ecdsa_component_size(),
+                )?;
                 Ok(raw)
             }
             _ => Err(TpmError::InvalidObject),
@@ -317,6 +345,20 @@ impl TpmSigner for EsapiTpm {
                 PropertyTag::LockoutRecovery,
             )?,
         })
+    }
+}
+
+const fn ecc_curve(algorithm: KeyAlgorithm) -> EccCurve {
+    match algorithm {
+        KeyAlgorithm::EcdsaNistP256 => EccCurve::NistP256,
+        KeyAlgorithm::EcdsaNistP384 => EccCurve::NistP384,
+    }
+}
+
+const fn hash_algorithm(algorithm: KeyAlgorithm) -> HashingAlgorithm {
+    match algorithm {
+        KeyAlgorithm::EcdsaNistP256 => HashingAlgorithm::Sha256,
+        KeyAlgorithm::EcdsaNistP384 => HashingAlgorithm::Sha384,
     }
 }
 
@@ -374,18 +416,26 @@ fn required_property(context: &mut Context, property: PropertyTag) -> Result<u32
         .ok_or(TpmError::Transport)
 }
 
-fn ssh_public_key(public: &Public) -> Result<Vec<u8>, TpmError> {
+fn ssh_public_key(public: &Public, algorithm: KeyAlgorithm) -> Result<Vec<u8>, TpmError> {
     let Public::Ecc { unique, .. } = public else {
         return Err(TpmError::InvalidObject);
     };
-    let mut point = Vec::with_capacity(65);
+    let mut point = Vec::with_capacity(1 + 2 * algorithm.ecdsa_component_size());
     point.push(4);
-    append_padded_32(&mut point, unique.x().value())?;
-    append_padded_32(&mut point, unique.y().value())?;
+    append_padded(
+        &mut point,
+        unique.x().value(),
+        algorithm.ecdsa_component_size(),
+    )?;
+    append_padded(
+        &mut point,
+        unique.y().value(),
+        algorithm.ecdsa_component_size(),
+    )?;
 
-    let mut blob = Vec::with_capacity(104);
-    append_ssh_string(&mut blob, b"ecdsa-sha2-nistp256");
-    append_ssh_string(&mut blob, b"nistp256");
+    let mut blob = Vec::new();
+    append_ssh_string(&mut blob, algorithm.ssh_key_type().as_bytes());
+    append_ssh_string(&mut blob, algorithm.ssh_curve_name().as_bytes());
     append_ssh_string(&mut blob, &point);
     Ok(blob)
 }
@@ -396,11 +446,11 @@ fn append_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
-fn append_padded_32(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TpmError> {
-    if value.len() > 32 {
+fn append_padded(output: &mut Vec<u8>, value: &[u8], width: usize) -> Result<(), TpmError> {
+    if value.len() > width {
         return Err(TpmError::InvalidObject);
     }
-    output.resize(output.len() + (32 - value.len()), 0);
+    output.resize(output.len() + (width - value.len()), 0);
     output.extend_from_slice(value);
     Ok(())
 }
@@ -440,6 +490,67 @@ mod tests {
     use tss_esapi::tcti_ldr::TctiNameConf;
 
     use super::DEFAULT_TCTI;
+
+    #[test]
+    fn validates_algorithm_scheme_and_authorization_attributes() {
+        use crate::TpmError;
+        use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
+        for algorithm in [KeyAlgorithm::EcdsaNistP256, KeyAlgorithm::EcdsaNistP384] {
+            for policy in [KeyUsePolicy::NoPin, KeyUsePolicy::TpmPin] {
+                let public =
+                    super::EsapiTpm::create_public(algorithm, policy).expect("public template");
+                assert_eq!(
+                    super::EsapiTpm::validate_public(&public, algorithm, policy),
+                    Ok(())
+                );
+                let other = match algorithm {
+                    KeyAlgorithm::EcdsaNistP256 => KeyAlgorithm::EcdsaNistP384,
+                    KeyAlgorithm::EcdsaNistP384 => KeyAlgorithm::EcdsaNistP256,
+                };
+                assert_eq!(
+                    super::EsapiTpm::validate_public(&public, other, policy),
+                    Err(TpmError::InvalidObject)
+                );
+                let wrong_policy = match policy {
+                    KeyUsePolicy::NoPin => KeyUsePolicy::TpmPin,
+                    KeyUsePolicy::TpmPin => KeyUsePolicy::NoPin,
+                };
+                assert_eq!(
+                    super::EsapiTpm::validate_public(&public, algorithm, wrong_policy),
+                    Err(TpmError::InvalidObject)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_incorrect_hash_on_the_selected_curve() {
+        use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
+        for algorithm in [KeyAlgorithm::EcdsaNistP256, KeyAlgorithm::EcdsaNistP384] {
+            let mut public =
+                super::EsapiTpm::create_public(algorithm, KeyUsePolicy::NoPin).expect("template");
+            let wrong_hash = match algorithm {
+                KeyAlgorithm::EcdsaNistP256 => super::HashingAlgorithm::Sha384,
+                KeyAlgorithm::EcdsaNistP384 => super::HashingAlgorithm::Sha256,
+            };
+            let scheme =
+                super::EccScheme::create(super::EccSchemeAlgorithm::EcDsa, Some(wrong_hash), None)
+                    .expect("scheme");
+            let super::Public::Ecc { parameters, .. } = &mut public else {
+                panic!("expected ECC");
+            };
+            *parameters = super::PublicEccParametersBuilder::new_unrestricted_signing_key(
+                scheme,
+                super::ecc_curve(algorithm),
+            )
+            .build()
+            .expect("parameters");
+            assert_eq!(
+                super::EsapiTpm::validate_public(&public, algorithm, KeyUsePolicy::NoPin),
+                Err(crate::TpmError::InvalidObject)
+            );
+        }
+    }
 
     #[test]
     fn default_tcti_is_the_explicit_kernel_resource_manager() {

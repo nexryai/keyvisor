@@ -443,3 +443,38 @@ fn manages_configuration_and_tpm_keys_without_a_gui() {
         Some("KEYVISOR-HISTORY-1")
     );
 }
+
+#[test]
+fn selects_key_algorithm_and_rejects_unknown_algorithms() {
+    let environment = TestEnvironment::start();
+    for (choice, ssh_type) in [
+        ("ecdsa-p256", "ecdsa-sha2-nistp256"),
+        ("ecdsa-p384", "ecdsa-sha2-nistp384"),
+    ] {
+        let created = environment.output(&[
+            "key",
+            "create",
+            "--name",
+            "Algorithm selection",
+            "--algorithm",
+            choice,
+            "--authorization",
+            "none",
+            "--yes",
+        ]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let id = String::from_utf8(created.stdout).expect("key identifier");
+        let shown = environment.output(&["key", "show", id.trim()]);
+        assert!(shown.status.success());
+        let text = String::from_utf8(shown.stdout).expect("key description");
+        assert!(text.contains(&format!("Algorithm: {ssh_type}\n")));
+        assert!(text.contains(&format!("Public key: {ssh_type} ")));
+    }
+    let rejected = environment.output(&["key", "create", "--algorithm", "unknown"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("algorithm must be"));
+}

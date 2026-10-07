@@ -33,12 +33,12 @@ use keyvisor_agent::{
         identities_response, parse_request,
     },
 };
-use keyvisor_core::KeyUsePolicy;
+use keyvisor_core::{KeyAlgorithm, KeyUsePolicy};
 use keyvisor_tpm::{EsapiTpm, TpmAuthorization, TpmSigner};
 use listenfd::ListenFd;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::{net::sockopt::socket_peercred, process::geteuid};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 use zeroize::Zeroizing;
 
 const MAX_PIN_BYTES: usize = 64;
@@ -344,7 +344,10 @@ impl AgentRuntime {
         data: &[u8],
         cancellation: &RequestCancellation,
     ) -> Result<Vec<u8>, String> {
-        let digest = Sha256::digest(data);
+        let digest = match key.summary.algorithm {
+            KeyAlgorithm::EcdsaNistP256 => Sha256::digest(data).to_vec(),
+            KeyAlgorithm::EcdsaNistP384 => Sha384::digest(data).to_vec(),
+        };
         // Prompt before taking the TPM mutex so another client can enumerate
         // identities or complete its authorization while the user is typing.
         let pin = match key.summary.use_policy {
@@ -371,12 +374,13 @@ impl AgentRuntime {
             .as_mut()
             .ok_or_else(|| String::from("TPM signer did not initialize"))?;
         let signature = signer
-            .sign(&key.object, &digest, authorization)
+            .sign(&key.object, key.summary.algorithm, &digest, authorization)
             .map_err(|error| format!("TPM signing failed: {error}"))?;
         // ESAPI signing is synchronous and cannot be interrupted safely.
         // Discard its result if the requesting client disconnected meanwhile.
         cancellation.check()?;
-        ecdsa_signature_response(&signature).map_err(|error| error.to_string())
+        ecdsa_signature_response(key.summary.algorithm, &signature)
+            .map_err(|error| error.to_string())
     }
 
     fn record_history(&self, key: &StoredKey, outcome: HistoryOutcome) {
