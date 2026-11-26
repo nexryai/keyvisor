@@ -329,11 +329,11 @@ mod tests {
                 algorithm.ssh_key_type().as_bytes()
             );
             let mut scalars = take_test_string(&mut signature_blob);
-            assert!(signature_blob.is_empty());
+            assert_eq!(signature_blob, []);
 
             let r = take_test_string(&mut scalars);
             let s = take_test_string(&mut scalars);
-            assert!(scalars.is_empty());
+            assert_eq!(scalars, []);
 
             // An unsigned TPM scalar with its high bit set needs a zero prefix so
             // SSH's signed mpint representation remains positive.
@@ -360,8 +360,8 @@ mod tests {
 
         // SSH represents zero as an empty mpint, not as a one-byte zero. This
         // is important even though a real ECDSA signature cannot contain zero.
-        assert!(take_test_string(&mut scalars).is_empty());
-        assert!(take_test_string(&mut scalars).is_empty());
+        assert_eq!(take_test_string(&mut scalars), []);
+        assert_eq!(take_test_string(&mut scalars), []);
 
         // The TPM backend contract is a fixed r||s encoding. Accepting any
         // other size could silently split the two components at the wrong byte.

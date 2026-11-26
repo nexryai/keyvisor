@@ -388,7 +388,7 @@ fn manages_configuration_and_tpm_keys_without_a_gui() {
         .expect("key ID is UTF-8")
         .trim()
         .to_owned();
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 
     let mut pin_creation = environment
         .command()
