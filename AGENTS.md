@@ -1,5 +1,10 @@
 # AGENTS.md
 
+This file contains the developer documentation for Keyvisor: product
+invariants, the security model, architecture, build and test instructions,
+packaging, and release process. The user-facing guide is
+[README.md](README.md).
+
 ## Scope
 
 These instructions apply to the whole Keyvisor source tree. `secretive/` is a
@@ -34,26 +39,433 @@ member.
 - A failed or unavailable TPM must fail closed. Do not silently create or load
   a disk-backed private key.
 
+## Security model
+
+The private key is generated inside the TPM as a non-migratable signing object.
+Keyvisor creates an ECDSA NIST P-256 or NIST P-384 child beneath a Keyvisor
+storage parent with:
+
+- `fixedTPM`;
+- `fixedParent`;
+- `sensitiveDataOrigin`;
+- `userWithAuth`;
+- `signEncrypt`;
+- no decrypt or duplication capability.
+
+The host may persist `TPM2B_PUBLIC` and the encrypted, integrity-protected
+`TPM2B_PRIVATE` blob produced by the TPM. That blob is not plaintext private key
+material and is usable only through its TPM parent. Signing calls `TPM2_Sign`;
+only the signature returns to Keyvisor. There is no software-key fallback and
+no private-key import, export, duplication, or migration feature.
+
+At key creation the user chooses one of two authorization modes:
+
+- **No PIN** uses an empty object `authValue` and sets `noDA`. The agent can ask
+  the TPM to sign without interactive authorization. The CLI must warn that any
+  process able to use the user's agent socket can request signatures.
+- **TPM-protected PIN** sets a non-empty object `authValue` and leaves `noDA`
+  clear. TPM dictionary-attack protection counts failed authorization attempts
+  and can refuse further attempts. Keyvisor requires the PIN for every
+  signature and never persists or caches it.
+
+PIN-bearing TPM commands use a salted HMAC session with command/response
+parameter encryption rather than a plaintext password session. CLI PIN input
+must come from a controlling terminal or another explicitly configured
+owner-only helper, never command-line arguments or environment variables.
+Keyvisor keeps owned PIN buffers short-lived and zeroizes them. The terminal
+authorization protocol uses an owner-only socket, validates peer credentials,
+and exposes no SSH payload. Missing or invalid authorization fails closed; a
+broader threat-model review remains part of release hardening.
+
+Dictionary-attack counters and the `maxTries`, `recoveryTime`, and
+`lockoutRecovery` parameters are TPM-wide state, not per-key settings. Keyvisor
+may display the effective values but never calls
+`TPM2_DictionaryAttackParameters` or resets lockout on a physical TPM.
+
+The TPM protects extraction, but it does not identify which local process asked
+the user's agent to sign. Socket ownership, peer credentials, request limits,
+explicit per-use authorization, and a privacy-preserving history reduce misuse.
+A CLI confirmation is defense in depth and is not protection against code
+already running as the same user.
+
+### Storage and runtime paths
+
+- Configuration: `$XDG_CONFIG_HOME/me.nexryai.keyvisor`, falling back to
+  `~/.config/me.nexryai.keyvisor`.
+- Key records: `$XDG_DATA_HOME/me.nexryai.keyvisor/keys`, falling back to
+  `~/.local/share/me.nexryai.keyvisor/keys`.
+- Runtime files and sockets: `$XDG_RUNTIME_DIR/keyvisor`, including
+  `agent.sock`.
+
+Metadata contains names, public keys, fingerprints, policy descriptors, TPM
+names, and TPM-wrapped blobs. The data directory is mode `0700`, records are
+mode `0600`, and writes use a same-directory temporary file followed by an
+atomic rename. Signing history is bounded and contains only timestamps, key
+identifiers and names, policy labels, and outcomes—never request payloads.
+
+The agent socket is owned by the current user, has mode `0600`, and lives in a
+mode `0700` directory. Any separate management or authorization socket must
+have the same ownership guarantees, validate peer credentials, use bounded
+messages and deadlines, and carry no SSH signing payload unless the protocol
+explicitly requires and reviews it. PINs must never enter D-Bus, persistent
+state, logs, command arguments, or environment variables.
+
 ## Target architecture
 
-- `keyvisor-core`: dependency-light domain types and protocol-neutral contracts.
-- `keyvisor-tpm`: the only crate allowed to talk to TPM2-TSS/ESAPI.
-- `keyvisor-agent`: SSH agent framing, request validation, socket lifecycle,
-  and calls into the TPM signer.
-- `keyvisor-cli`: command-line key/configuration management and agent status
-  client. It must not depend on a graphical toolkit.
-- `data`: systemd user service and socket files only.
+```text
+ssh / git
+    │ SSH agent protocol, $SSH_AUTH_SOCK
+    ▼
+keyvisor-agent ── owner-only control protocol ── keyvisor CLI
+    │ sign                                  │ create
+    └──────────────┬────────────────────────┘
+                   ▼
+             keyvisor-tpm ── TPM2-TSS ESAPI ── TPM 2.0
+```
 
-Keep the CLI and agent responsibilities separate. A control API must carry only
-the minimum data required for its operation, use owner-only local transport,
-validate peers, and never carry raw SSH signing payloads. PIN transport requires
-an explicit security review and must never use D-Bus, arguments, environment
-variables, persistent storage, or logs.
+- `keyvisor-core` contains dependency-light domain types and protocol-neutral
+  contracts.
+- `keyvisor-tpm` is the only crate that talks to TPM2-TSS/ESAPI.
+- `keyvisor-agent` owns SSH agent framing, request validation, socket lifecycle,
+  signing history, and TPM signing operations. It runs as a socket-activated
+  systemd user service or as a foreground process for development.
+- `keyvisor-cli` provides the installed `keyvisor` command and contains no GUI
+  toolkit dependency. It manages public metadata and asks `keyvisor-tpm` to
+  generate TPM-resident signing objects, but it never performs SSH signing.
 
-Keyvisor must not grow its own GUI toolkit dependency. On graphical sessions,
-secret entry may use the external `pinentry-gnome3` agent over bounded Assuan
-pipes. Do not enable pinentry's external password cache, and retain `/dev/tty`
-and explicit stdin paths for headless and automated operation.
+The workspace and packages contain no GUI crate, desktop entry, AppStream
+desktop component, application icons, graphical toolkit dependency, or
+UI-oriented D-Bus API. Graphical sessions may use the external GNOME pinentry
+agent for system-integrated secret entry without restoring a Keyvisor GUI.
+
+The former graphical application has been removed completely. The application
+ID remains `me.nexryai.keyvisor` for storage paths, systemd units, and other
+compatibility-sensitive identifiers; it does not imply a graphical application.
+
+## CLI contract
+
+The CLI provides these stable, scriptable command families:
+
+```text
+keyvisor key create
+keyvisor key list
+keyvisor key show ID
+keyvisor key delete ID
+keyvisor config list
+keyvisor config get NAME
+keyvisor config set NAME VALUE
+keyvisor agent status
+keyvisor history
+keyvisor authorize REQUEST_ID
+keyvisor exec -- COMMAND [ARGUMENT ...]
+```
+
+The following rules define the implemented CLI contract:
+
+- human-readable output is the default and a versioned machine-readable format
+  is available explicitly;
+- destructive operations require an interactive confirmation unless an
+  explicit automation flag is supplied;
+- secrets are read without terminal echo and never accepted as arguments;
+- physical TPM access defaults explicitly to the kernel resource manager at
+  `/dev/tpmrm0` and never silently falls back to raw `/dev/tpm0` access;
+- graphical sessions use `pinentry-gnome3` automatically, while headless
+  sessions use the single-terminal `exec` wrapper or the explicit two-terminal
+  authorization workflow;
+- stdout is reserved for requested data, while diagnostics go to stderr;
+- success and common failure modes have documented, stable exit behavior;
+- non-interactive use fails clearly when an operation requires a terminal;
+- configuration and persistent data follow documented XDG paths, while
+  documented environment variables select TPM and socket endpoints;
+- configuration contains no PINs or other secrets, and it cannot alter or reset
+  physical-TPM dictionary-attack parameters.
+
+The versioned non-interactive formats are `KEYVISOR-KEYS-1` for
+`keyvisor key list --format tsv` and `KEYVISOR-HISTORY-1` for
+`keyvisor history --format tsv`. The authorization timeout accepts 10–120
+seconds.
+
+## SSH protocol scope
+
+The implemented SSH protocol supports:
+
+- `SSH2_AGENTC_REQUEST_IDENTITIES`;
+- `SSH2_AGENTC_SIGN_REQUEST`;
+- ECDSA P-256 keys exposed as `ecdsa-sha2-nistp256`;
+- ECDSA P-384 keys exposed as `ecdsa-sha2-nistp384`;
+- strict packet length limits and request timeouts.
+
+Add/remove identity, smart-card, lock/unlock, and unknown extension requests
+fail closed. RSA/SHA-2 may be added only after the ECDSA path and its encoding
+tests are complete.
+
+## Build and test
+
+Keyvisor requires Rust 1.92 or newer. On Fedora, install Rust, TPM2-TSS, the
+software TPM used by tests, OpenSSH, and the native build tools:
+
+```sh
+sudo dnf install \
+  cargo clippy gcc openssh-clients pinentry-gnome3 pkgconf-pkg-config \
+  rust rustfmt swtpm systemd tpm2-tss-devel
+```
+
+Add the account that runs Keyvisor to the `tss` group so it can use the kernel
+TPM resource manager:
+
+```sh
+sudo usermod -aG tss "$USER"
+```
+
+Log out completely and log back in before continuing; opening another terminal
+may not refresh supplementary groups. Verify both membership and device access:
+
+```sh
+id
+ls -l /dev/tpm0 /dev/tpmrm0
+test -r /dev/tpmrm0 && test -w /dev/tpmrm0
+```
+
+Keyvisor uses `/dev/tpmrm0` by default and never falls back automatically to the
+raw, single-client `/dev/tpm0` device. `TPM2TOOLS_TCTI`, `TCTI`, and `TEST_TCTI`
+remain explicit overrides for test simulators or unusual deployments. For
+example, the following selects the same kernel resource manager explicitly:
+
+```sh
+export TPM2TOOLS_TCTI=device:/dev/tpmrm0
+```
+
+Do not run Keyvisor with `sudo`, which would create root-owned state, and do not
+make `/dev/tpm0` or `/dev/tpmrm0` world-accessible. If `/dev/tpmrm0` does not
+exist, inspect `sudo journalctl -k -b | grep -i tpm` and confirm that
+`tpm2-tss` is installed before using a physical TPM.
+
+Build the workspace:
+
+```sh
+cargo build --workspace
+```
+
+This produces `target/debug/keyvisor` and `target/debug/keyvisor-agent`.
+
+Run the checks before committing or releasing:
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+```
+
+The agent suite also invokes installed `ssh-add` and `ssh-keygen` clients to
+enumerate an identity, request a TPM-backed signature, and verify the resulting
+SSHSIG. Integration tests start isolated `swtpm` processes and never use the
+host's physical TPM. Physical TPM tests are opt-in and must never clear, take
+ownership of, or evict unrelated persistent objects.
+
+For a development session, run the agent in the foreground:
+
+```sh
+keyvisor-agent serve
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
+ssh-add -L
+```
+
+## Packaging and release
+
+The repository supports local SRPM uploads and Git-based builds from the COPR
+Web UI. Both paths use the same packaging script, which produces two
+deterministic source archives. The first contains Keyvisor without the
+read-only `secretive/` reference tree. The second contains all crates from
+`Cargo.lock`, including Cargo checksum metadata. The actual RPM build is
+therefore offline and always uses the locked dependency graph.
+
+### Packaging prerequisites
+
+Install the packaging tools and native build dependencies:
+
+```sh
+sudo dnf install \
+  cargo copr-cli gcc mock openssh-clients pkgconf-pkg-config \
+  pinentry-gnome3 rpm-build rust swtpm systemd-rpm-macros tpm2-tss-devel xz
+```
+
+The account used for local `mock` builds must be in the `mock` group. Log out
+and back in after adding it:
+
+```sh
+sudo usermod -aG mock "$USER"
+```
+
+### Build and inspect an SRPM
+
+Run from the repository root:
+
+```sh
+./build-aux/srpm.sh dist
+rpm -qpi dist/keyvisor-0.1.2-1*.src.rpm
+```
+
+Build it in a clean Fedora 44 chroot before uploading:
+
+```sh
+mock -r fedora-44-x86_64 \
+  --rebuild dist/keyvisor-0.1.2-1*.src.rpm
+```
+
+The RPM test suite uses `swtpm`; it does not access the builder's physical TPM.
+
+### Upload an SRPM directly
+
+Download the API token from the COPR account page and save it as
+`~/.config/copr`. Create the project once, replacing `OWNER` as appropriate:
+
+```sh
+copr-cli create keyvisor \
+  --chroot fedora-44-x86_64 \
+  --chroot fedora-rawhide-x86_64
+copr-cli build OWNER/keyvisor dist/keyvisor-0.1.2-1*.src.rpm
+```
+
+For a project owned by the logged-in user, `keyvisor` can be used instead of
+`OWNER/keyvisor`.
+
+### Build from Git in the COPR Web UI
+
+Push the repository to a publicly readable Git URL, then open the COPR project
+and select **New Build**. Choose **SCM** and enter:
+
+- Clone URL: the repository's HTTPS clone URL;
+- Committish: `main`, or the release tag or commit to build;
+- Subdirectory: leave empty;
+- Spec File: `keyvisor.spec`;
+- SCM type: `git`;
+- Build method: `make srpm`.
+
+Submit the form after selecting the desired chroots. COPR invokes the sole
+Makefile adapter as:
+
+```sh
+make -f .copr/Makefile srpm outdir="..." spec="keyvisor.spec"
+```
+
+The adapter installs only the SRPM-generation tools and delegates to
+`build-aux/srpm.sh`. The resulting binary RPM build remains offline and runs
+Cargo directly from `keyvisor.spec`; Make is not part of the project build.
+
+### Verify the package
+
+After a successful build, install it on a Fedora machine with a TPM:
+
+```sh
+sudo dnf copr enable nexryai/keyvisor
+sudo dnf install keyvisor
+systemctl --user enable --now me.nexryai.keyvisor-agent.socket
+```
+
+Set `SSH_AUTH_SOCK` for shells that should use Keyvisor:
+
+```sh
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyvisor/agent.sock"
+```
+
+### Release checklist
+
+- Keep `Version` synchronized in `Cargo.toml` and `keyvisor.spec`.
+- Bump `Release` for packaging-only changes.
+- Update `%changelog`.
+- Commit the refreshed `Cargo.lock` whenever the workspace version or a
+  dependency changes; COPR source generation rejects a stale lockfile.
+- Run `cargo fmt`, `cargo clippy`, and the workspace tests before building.
+- Inspect the SRPM source list to confirm `secretive/` is absent.
+- Build with `mock` for every enabled COPR architecture and Fedora release.
+- Inspect the binary package to confirm it contains only the CLI, agent,
+  systemd user units, licenses, and documentation.
+- Update `README.md` for user-visible changes and this file for developer or
+  security-boundary changes.
+
+## Implementation status
+
+### M0 — existing TPM and SSH foundation (implemented)
+
+- [x] generate non-migratable P-256 signing objects in no-PIN and TPM-PIN modes;
+- [x] use encrypted salted HMAC sessions and map authorization/lockout errors;
+- [x] persist only validated public metadata and TPM-wrapped blobs;
+- [x] implement bounded SSH agent framing, identity enumeration, and signing;
+- [x] provide owner-only sockets and native systemd socket activation;
+- [x] exercise TPM and OpenSSH paths with isolated `swtpm` instances.
+
+### M1 — CLI management parity (implemented)
+
+- [x] add a dependency-light `keyvisor-cli` crate producing `keyvisor`;
+- [x] implement key create, list, show, and delete commands;
+- [x] implement config list, get, and set commands for documented non-secret
+  settings with atomic owner-only persistence;
+- [x] implement agent status and bounded signing-history commands;
+- [x] define human and versioned machine-readable output contracts;
+- [x] read creation PINs from a terminal, confirm them, minimize copies, and
+  zeroize owned buffers;
+- [x] document shell setup, configuration precedence, exit behavior, and
+  non-interactive limitations;
+- [x] add focused CLI parsing, output, permission, and `swtpm` integration tests.
+
+### M2 — terminal per-signature authorization (core implemented)
+
+- [x] design an owner-only, peer-validated, bounded authorization protocol;
+- [x] expose pending requests using opaque identifiers and non-sensitive key
+  metadata, never raw SSH payloads;
+- [x] implement `keyvisor authorize REQUEST_ID` with no-echo terminal PIN input;
+- [x] launch GNOME pinentry automatically for graphical-session requests and
+  preserve explicit terminal and non-interactive modes;
+- [x] enforce cancellation, client-disconnect propagation, and a configurable
+  authorization deadline without caching a PIN;
+- [x] ensure concurrent requests cannot authorize the wrong operation;
+- [x] implement `keyvisor exec -- COMMAND` with no-echo `/dev/tty` PIN entry,
+  inherited command I/O, signal forwarding, exact child exit status, and safe
+  refusal of pre-existing or ambiguous concurrent requests;
+- [x] document that authorization is defense in depth against accidental use,
+  not a boundary against same-user malware;
+- [ ] test wrong PINs, timeouts, disconnects, and dictionary-attack reporting
+  with `swtpm`; terminal success, cancellation, and concurrency have automated
+  coverage.
+
+### M3 — GUI removal (complete)
+
+- [x] remove `keyvisor-ui` from the workspace and source tree;
+- [x] remove graphical toolkit and UI-only GLib/D-Bus dependencies;
+- [x] remove the desktop entry, AppStream desktop component, application icons,
+  screenshots, notifications, and GUI launch/install rules;
+- [x] remove the UI-oriented D-Bus management API after CLI parity exists;
+- [x] use Cargo directly for builds and RPM packaging, with no Meson or general
+  Makefile layer; retain only COPR's required `.copr/Makefile` adapter;
+- [x] verify that no GUI process or toolkit is required at build time or runtime.
+
+### M4 — hardening and release
+
+- [ ] add explicit negative duplication and full lockout/recovery tests;
+- [ ] review the CLI/control-protocol threat model and dependencies;
+- [ ] add fuzzing for SSH and control protocol parsers;
+- [ ] audit logs and diagnostic paths for sensitive values;
+- [ ] produce reproducible native packages and operator documentation.
+
+### P-384 algorithm selection (Issue #2)
+
+- [x] expose `--algorithm ecdsa-p256|ecdsa-p384`, retaining P-256 by default;
+- [x] preserve P-256 record tag 1 and assign P-384 tag 2 without migration;
+- [x] validate the recorded curve and ECDSA hash before loading TPM objects;
+- [x] use SHA-384 and 48-byte coordinates/scalars for P-384;
+- [x] reject unsupported TPM curves and preserve TPM generation, authorization,
+  encrypted sessions, and DA behavior for both algorithms;
+- [x] cover both algorithms with simulator and OpenSSH signature verification.
+
+## Definition of done
+
+Keyvisor's CLI transition is complete when the GUI crate and desktop artifacts
+are gone, all supported management workflows are available through documented
+CLI commands, TPM-PIN signatures have a tested terminal authorization path, and
+packages require no graphical toolkit. Keyvisor is TPM-backed only when keys
+are TPM-generated and fixed to this TPM and parent, every SSH signature is
+produced by `TPM2_Sign`, unsupported requests fail closed, and no normal or
+error path exposes plaintext private parameters.
 
 ## Source comments
 
@@ -71,7 +483,8 @@ and explicit stdin paths for headless and automated operation.
 
 ## Development workflow
 
-1. Update `PLANS.md` when a security boundary or milestone changes.
+1. Update this file when a security boundary, milestone, or developer workflow
+   changes, and update `README.md` when user-facing behavior changes.
 2. Format with `cargo fmt --all -- --check`.
 3. Run focused tests first, then `cargo test --locked --workspace`.
 4. Run `cargo clippy --locked --workspace --all-targets -- -D warnings` before

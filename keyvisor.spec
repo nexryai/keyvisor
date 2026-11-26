@@ -75,7 +75,7 @@ cargo test --locked --offline --workspace --all-features
 
 %files
 %license LICENSE
-%doc README.md PLANS.md
+%doc README.md
 %{_bindir}/keyvisor
 %{_bindir}/keyvisor-agent
 %{_userunitdir}/me.nexryai.keyvisor-agent.service
